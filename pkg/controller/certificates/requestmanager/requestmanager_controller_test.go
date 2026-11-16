@@ -1,0 +1,1177 @@
+/*
+Copyright 2020 The cert-manager Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package requestmanager
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	coretesting "k8s.io/client-go/testing"
+	"k8s.io/component-base/featuregate"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	fakeclock "k8s.io/utils/clock/testing"
+
+	"github.com/cert-manager/cert-manager/internal/controller/feature"
+	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
+	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
+	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
+	"github.com/cert-manager/cert-manager/pkg/util/pki"
+	"github.com/cert-manager/cert-manager/test/unit/gen"
+)
+
+func mustGenerateRSA(t *testing.T) []byte {
+	pk, err := pki.GenerateRSAPrivateKey(2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := pki.EncodePKCS8PrivateKey(pk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+func mustGenerateECDSA(t *testing.T) []byte {
+	pk, err := pki.GenerateECPrivateKey(256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := pki.EncodePKCS8PrivateKey(pk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
+func relaxedCertificateRequestMatcher(l coretesting.Action, r coretesting.Action) error {
+	objL := l.(coretesting.CreateAction).GetObject().(*cmapi.CertificateRequest)
+	objR := r.(coretesting.CreateAction).GetObject().(*cmapi.CertificateRequest)
+	if diff := cmp.Diff(objL, objR, cmpopts.IgnoreFields(cmapi.CertificateRequestSpec{}, "Request")); diff != "" {
+		return fmt.Errorf("unexpected difference between actions (-want +got):\n%s", diff)
+	}
+	return nil
+}
+
+// nextPrivateKeySecretMeta builds the ObjectMeta that the keymanager
+// controller gives to a next private key Secret: the labels it sets, and a
+// controller owner reference back to the Certificate. The requestmanager controller
+// only consumes Secrets carrying the next-private-key label and that owner
+// reference, so fixtures must set them.
+func nextPrivateKeySecretMeta(crt *cmapi.Certificate, name string) metav1.ObjectMeta {
+	return metav1.ObjectMeta{
+		Namespace: crt.Namespace,
+		Name:      name,
+		Labels: map[string]string{
+			cmapi.IsNextPrivateKeySecretLabelKey:      "true",
+			cmapi.PartOfCertManagerControllerLabelKey: "true",
+		},
+		OwnerReferences: []metav1.OwnerReference{
+			*metav1.NewControllerRef(crt, certificateGvk),
+		},
+	}
+}
+
+func TestProcessItem(t *testing.T) {
+	bundle1 := mustCreateCryptoBundle(t, &cmapi.Certificate{
+		Namespace: "testns",
+		Name:      "test",
+		UID:       "test",
+		Spec:      cmapi.CertificateSpec{CommonName: "test-bundle-1"},
+	},
+	)
+	bundle2 := mustCreateCryptoBundle(t, &cmapi.Certificate{
+		Namespace: "testns",
+		Name:      "test",
+		UID:       "test",
+		Spec:      cmapi.CertificateSpec{CommonName: "test-bundle-2"},
+	},
+	)
+	bundle3 := mustCreateCryptoBundle(t, &cmapi.Certificate{
+		Namespace: "testns",
+		Name:      "test",
+		UID:       "test",
+		Spec:      cmapi.CertificateSpec{CommonName: "test-bundle-3"},
+	},
+	)
+	bundle4 := mustCreateCryptoBundle(t, &cmapi.Certificate{
+		Namespace: "testns",
+		Name:      strings.Repeat("a", 167) + "b" + strings.Repeat("c", 85),
+		UID:       "test",
+		Spec:      cmapi.CertificateSpec{CommonName: "test-bundle-4"},
+	},
+	)
+	fixedNow := metav1.NewTime(time.Now())
+	fixedClock := fakeclock.NewFakeClock(fixedNow.Time)
+	failedCRConditionPreviousIssuance := cmapi.CertificateRequestCondition{
+		Type:               cmapi.CertificateRequestConditionReady,
+		Status:             cmmeta.ConditionFalse,
+		Reason:             cmapi.CertificateRequestReasonFailed,
+		LastTransitionTime: &metav1.Time{Time: fixedNow.Time.Add(-1 * time.Hour)},
+	}
+	failedCRConditionThisIssuance := cmapi.CertificateRequestCondition{
+		Type:               cmapi.CertificateRequestConditionReady,
+		Status:             cmmeta.ConditionFalse,
+		Reason:             cmapi.CertificateRequestReasonFailed,
+		LastTransitionTime: &metav1.Time{Time: fixedNow.Time.Add(1 * time.Minute)},
+	}
+	// incompleteRequest builds a CertificateRequest for the revision being
+	// issued that has a failureTime and no Ready condition. The creationTimestamp
+	// is pinned because it decides which issuance the request belongs to.
+	incompleteRequest := func(failureTime, creation time.Time, mods ...gen.CertificateRequestModifier) *cmapi.CertificateRequest {
+		return gen.CertificateRequestFrom(bundle1.certificateRequest, append([]gen.CertificateRequestModifier{
+			gen.SetCertificateRequestName("test-6"),
+			gen.SetCertificateRequestAnnotations(map[string]string{
+				cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+				cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+			}),
+			gen.SetCertificateRequestFailureTime(metav1.Time{Time: failureTime}),
+			func(cr *cmapi.CertificateRequest) {
+				cr.Status.Conditions = nil
+				cr.CreationTimestamp = metav1.NewTime(creation)
+			},
+		}, mods...)...)
+	}
+
+	tests := map[string]struct {
+		// key that should be passed to ProcessItem.
+		// if not set, the 'namespace/name' of the 'Certificate' field will be used.
+		// if neither is set, the key will be ""
+		key types.NamespacedName
+
+		// Featuregates to set for a particular test.
+		featuresFlags map[featuregate.Feature]bool
+
+		// Certificate to be synced for the test.
+		// if not set, the 'key' will be passed to ProcessItem instead.
+		certificate *cmapi.Certificate
+
+		secrets []runtime.Object
+
+		// Request, if set, will exist in the apiserver before the test is run.
+		requests []runtime.Object
+
+		expectedActions []testpkg.Action
+
+		expectedEvents []string
+
+		// err is the expected error text returned by the controller, if any.
+		err string
+	}{
+		"do nothing if an empty 'key' is used": {},
+		"do nothing if an invalid 'key' is used": {
+			key: types.NamespacedName{
+				Namespace: "abc",
+				Name:      "def/ghi",
+			},
+		},
+		"do nothing if a key references a Certificate that does not exist": {
+			key: types.NamespacedName{
+				Namespace: "namespace",
+				Name:      "name",
+			},
+		},
+		"do nothing if Certificate has 'Issuing' condition set to 'false'": {
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionFalse}),
+			),
+		},
+		"do nothing if Certificate has no 'Issuing' condition": {
+			certificate: bundle1.certificate,
+		},
+		"do nothing if status.nextPrivateKeySecretName is not set": {
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+			),
+		},
+		"do nothing if status.nextPrivateKeySecretName does not exist": {
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("does-not-exist"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+			),
+		},
+		"do nothing if status.nextPrivateKeySecretName contains no data": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists-but-empty"),
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists-but-empty"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+			),
+		},
+		"do nothing if status.nextPrivateKeySecretName names a Secret not owned by the Certificate": {
+			// A principal with access only to the certificates/status
+			// subresource must not be able to make the controller read an
+			// unrelated Secret and copy its private key into spec.secretName.
+			//
+			// The Secret is labeled and has a controller owner reference, so
+			// only the owner UID comparison rejects it.
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(gen.CertificateFrom(bundle1.certificate, gen.SetCertificateUID("other-uid")), "not-ours"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateUID("cert-uid"),
+				gen.SetCertificateNextPrivateKeySecretName("not-ours"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+			),
+		},
+		"do nothing if status.nextPrivateKeySecretName contains invalid data": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists-but-invalid"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: []byte("invalid")},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists-but-invalid"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+			),
+		},
+		"create a CertificateRequest if none exists and StableCertificateRequestName disabled": {
+			featuresFlags: map[featuregate.Feature]bool{
+				feature.StableCertificateRequestName: false,
+			},
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+			),
+			expectedEvents: []string{`Normal Requested Created new CertificateRequest resource "test-notrandom"`},
+			expectedActions: []testpkg.Action{
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle1.certificateRequest,
+						gen.SetCertificateRequestName(""),
+						gen.SetCertificateRequestGenerateName("test-"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "1",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"create a CertificateRequest if none exists": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle3.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle3.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle3.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+			),
+			expectedEvents: []string{`Normal Requested Created new CertificateRequest resource "test-1"`},
+			expectedActions: []testpkg.Action{
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle3.certificateRequest,
+						gen.SetCertificateRequestName("test-1"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "1",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"create a CertificateRequest if none exists (with long name)": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle3.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle3.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle4.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+				gen.SetCertificateRevision(19),
+			),
+			expectedEvents: []string{
+				fmt.Sprintf(`Normal Requested Created new CertificateRequest resource "%s"`, strings.Repeat("a", 167)+"b-d3f4fc40a686edfd404adf1d3fb1530653988c878e6c9c07b2e2fa4001a21269-20"),
+			},
+			expectedActions: []testpkg.Action{
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle4.certificateRequest,
+						gen.SetCertificateRequestName(strings.Repeat("a", 167)+"b-d3f4fc40a686edfd404adf1d3fb1530653988c878e6c9c07b2e2fa4001a21269-20"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "20",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"create a CertificateRequest if none exists (with long name and very large revision)": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle3.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle3.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle4.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+				gen.SetCertificateRevision(999999999),
+			),
+			expectedEvents: []string{
+				fmt.Sprintf(`Normal Requested Created new CertificateRequest resource "%s"`, strings.Repeat("a", 167)+"b-d3f4fc40a686edfd404adf1d3fb1530653988c878e6c9c07b2e2fa4001a21269-1000000000"),
+			},
+			expectedActions: []testpkg.Action{
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle4.certificateRequest,
+						gen.SetCertificateRequestName(strings.Repeat("a", 167)+"b-d3f4fc40a686edfd404adf1d3fb1530653988c878e6c9c07b2e2fa4001a21269-1000000000"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "1000000000",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"delete the owned CertificateRequest and create a new one if existing one does not have the annotation": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: mustGenerateRSA(t)},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+			),
+			requests: []runtime.Object{
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("random-value"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "",
+					}),
+				),
+			},
+			expectedEvents: []string{`Normal Requested Created new CertificateRequest resource "test-1"`},
+			expectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewDeleteAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns", "random-value")),
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle1.certificateRequest,
+						gen.SetCertificateRequestName("test-1"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "1",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"delete the owned CertificateRequest and create a new one if existing one contains invalid annotation": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: mustGenerateRSA(t)},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+			),
+			requests: []runtime.Object{
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("random-value"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "invalid",
+					}),
+				),
+			},
+			expectedEvents: []string{`Normal Requested Created new CertificateRequest resource "test-1"`},
+			expectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewDeleteAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns", "random-value")),
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle1.certificateRequest,
+						gen.SetCertificateRequestName("test-1"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "1",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"do nothing if existing CertificateRequest is valid for the spec": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+			),
+			requests: []runtime.Object{
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("random-value"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "1",
+					}),
+				),
+			},
+		},
+		"should delete requests that contain invalid CSR data": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+			),
+			requests: []runtime.Object{
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("random-value"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "1",
+					}),
+					gen.SetCertificateRequestCSR([]byte("invalid")),
+				),
+			},
+			expectedEvents: []string{`Normal Requested Created new CertificateRequest resource "test-1"`},
+			expectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewDeleteAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns", "random-value")),
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle1.certificateRequest,
+						gen.SetCertificateRequestName("test-1"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "1",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"should ignore requests that do not have a revision of 'current + 1' and create a new one": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: mustGenerateRSA(t)},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+			),
+			requests: []runtime.Object{
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("test-3"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "3",
+					}),
+				),
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("test-4"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "4",
+					}),
+				),
+			},
+			expectedEvents: []string{`Normal Requested Created new CertificateRequest resource "test-1"`},
+			expectedActions: []testpkg.Action{
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle1.certificateRequest,
+						gen.SetCertificateRequestName("test-1"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "1",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"should delete request for the current revision if public keys do not match": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: mustGenerateRSA(t)},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+			),
+			requests: []runtime.Object{
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("test-1"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "1",
+					}),
+				),
+				// included here just to ensure it does not get deleted as it is not for the
+				// 'next' revision that is being requested
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("test-4"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "4",
+					}),
+				),
+			},
+			expectedEvents: []string{`Normal Requested Created new CertificateRequest resource "test-1"`},
+			expectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewDeleteAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns", "test-1")),
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle1.certificateRequest,
+						gen.SetCertificateRequestName("test-1"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "1",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"should delete request for the current revision if public keys do not match (with explicit revision)": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle2.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+				gen.SetCertificateRevision(5),
+			),
+			requests: []runtime.Object{
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("test-6"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+					}),
+				),
+				// included here just to ensure it does not get deleted as it is not for the
+				// 'next' revision that is being requested
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("test-5"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "5",
+					}),
+				),
+			},
+			expectedEvents: []string{`Normal Requested Created new CertificateRequest resource "test-6"`},
+			expectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewDeleteAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns", "test-6")),
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle2.certificateRequest,
+						gen.SetCertificateRequestName("test-6"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"should recreate the CertificateRequest if the CSR is not signed by the stored private key": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: mustGenerateRSA(t)},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+				gen.SetCertificateRevision(5),
+			),
+			requests: []runtime.Object{
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("test-6"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+					}),
+				),
+			},
+			expectedEvents: []string{`Normal Requested Created new CertificateRequest resource "test-6"`},
+			expectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewDeleteAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns", "test-6")),
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle1.certificateRequest,
+						gen.SetCertificateRequestName("test-6"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"should recreate the CertificateRequest if the CSR does not match requirements on spec": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateCommonName("something-different"),
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+				gen.SetCertificateRevision(5),
+			),
+			requests: []runtime.Object{
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("test-6"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+					}),
+				),
+			},
+			expectedEvents: []string{`Normal Requested Created new CertificateRequest resource "test-6"`},
+			expectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewDeleteAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns", "test-6")),
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle1.certificateRequest,
+						gen.SetCertificateRequestName("test-6"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"should do nothing if request has an up to date CSR and it is still pending": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+				gen.SetCertificateRevision(5),
+			),
+			requests: []runtime.Object{
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("random-value"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+					}),
+				),
+			},
+		},
+		// This state is terminal: nothing is deleted, no error is returned and so
+		// the item is forgotten, and every re-sync takes the same branch. A human
+		// has to delete the surplus CertificateRequests, hence the Warning event.
+		"should record a Warning event if multiple owned and up to date CertificateRequests for the current revision exist": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+				gen.SetCertificateRevision(5),
+			),
+			requests: []runtime.Object{
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("random-value-1"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+					}),
+				),
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("random-value-2"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+					}),
+				),
+			},
+			expectedEvents: []string{
+				`Warning RequestConflict Multiple matching CertificateRequest resources exist (random-value-1, random-value-2), delete all but one of them to allow issuance to continue`,
+			},
+		},
+		"should recreate the CertificateRequest if the current 'next' CertificateRequest failed during previous issuance cycle with no failureTime set": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue, LastTransitionTime: &fixedNow}),
+				gen.SetCertificateRevision(5),
+			),
+			requests: []runtime.Object{
+				// An external issuer can write the Ready condition
+				// without failureTime; the condition's
+				// lastTransitionTime dates the failure.
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("test-6"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+					}),
+					gen.AddCertificateRequestStatusCondition(failedCRConditionPreviousIssuance),
+					func(cr *cmapi.CertificateRequest) {
+						cr.CreationTimestamp = metav1.Time{Time: fixedNow.Time.Add(time.Hour * -2)}
+					},
+				),
+			},
+			expectedEvents: []string{`Normal Requested Created new CertificateRequest resource "test-6"`},
+			expectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewDeleteAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns", "test-6")),
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle1.certificateRequest,
+						gen.SetCertificateRequestName("test-6"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"should recreate the CertificateRequest if the current 'next' CertificateRequest was created before the Issuing transition but has no failureTime and no Ready lastTransitionTime": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue, LastTransitionTime: &fixedNow}),
+				gen.SetCertificateRevision(5),
+			),
+			requests: []runtime.Object{
+				// Neither failureTime nor a Ready lastTransitionTime:
+				// creationTimestamp is the only date left.
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("test-6"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+					}),
+					gen.AddCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
+						Type:    cmapi.CertificateRequestConditionReady,
+						Status:  cmmeta.ConditionFalse,
+						Reason:  cmapi.CertificateRequestReasonFailed,
+						Message: "The certificate request failed because of reasons",
+					}),
+					func(cr *cmapi.CertificateRequest) {
+						cr.CreationTimestamp = metav1.Time{Time: fixedNow.Time.Add(time.Hour * -2)}
+					},
+				),
+			},
+			expectedEvents: []string{`Normal Requested Created new CertificateRequest resource "test-6"`},
+			expectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewDeleteAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns", "test-6")),
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle1.certificateRequest,
+						gen.SetCertificateRequestName("test-6"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"should recreate the CertificateRequest if the current 'next' CertificateRequest failed during previous issuance cycle": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue, LastTransitionTime: &fixedNow}),
+				gen.SetCertificateRevision(5),
+			),
+			requests: []runtime.Object{
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("test-6"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+					}),
+					gen.AddCertificateRequestStatusCondition(failedCRConditionPreviousIssuance),
+					gen.SetCertificateRequestFailureTime(metav1.Time{Time: fixedNow.Time.Add(time.Hour * -1)}),
+				),
+			},
+			expectedEvents: []string{`Normal Requested Created new CertificateRequest resource "test-6"`},
+			expectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewDeleteAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns", "test-6")),
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle1.certificateRequest,
+						gen.SetCertificateRequestName("test-6"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		"should do nothing if the CertificateRequest that is valid for spec has failed during this issuance cycle": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue, LastTransitionTime: &fixedNow}),
+				gen.SetCertificateRevision(5),
+			),
+			requests: []runtime.Object{
+				gen.CertificateRequestFrom(bundle1.certificateRequest,
+					gen.SetCertificateRequestName("random-value"),
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+					}),
+					gen.AddCertificateRequestStatusCondition(failedCRConditionThisIssuance),
+					gen.SetCertificateRequestFailureTime(metav1.Time{Time: fixedNow.Time.Add(1 * time.Minute)}),
+				),
+			},
+		},
+		// A CertificateRequest that failed without saying so is recycled on the
+		// same terms as a Ready=False/Failed one: only once the issuing
+		// controller has counted the failure, which the Issuing transition
+		// records.
+		"should recreate the CertificateRequest if the current 'next' CertificateRequest is an incomplete failure from a previous issuance cycle": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue, LastTransitionTime: &fixedNow}),
+				gen.SetCertificateRevision(5),
+			),
+			requests: []runtime.Object{
+				incompleteRequest(fixedNow.Time.Add(-time.Hour), fixedNow.Time.Add(-2*time.Hour)),
+			},
+			expectedEvents: []string{`Normal Requested Created new CertificateRequest resource "test-6"`},
+			expectedActions: []testpkg.Action{
+				testpkg.NewAction(coretesting.NewDeleteAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns", "test-6")),
+				testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+					gen.CertificateRequestFrom(bundle1.certificateRequest,
+						gen.SetCertificateRequestName("test-6"),
+						gen.SetCertificateRequestAnnotations(map[string]string{
+							cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+							cmapi.CertificateRequestRevisionAnnotationKey:   "6",
+						}),
+					)), relaxedCertificateRequestMatcher),
+			},
+		},
+		// Kept, so that the issuing controller records the failure and the
+		// trigger controller's backoff paces the retry.
+		"should do nothing if the incomplete CertificateRequest failed during this issuance cycle": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue, LastTransitionTime: &fixedNow}),
+				gen.SetCertificateRevision(5),
+			),
+			requests: []runtime.Object{
+				incompleteRequest(fixedNow.Time.Add(time.Minute), fixedNow.Time.Add(time.Second)),
+			},
+		},
+		// creationTimestamp comes from the API server and failureTime from the
+		// issuer, so an issuer whose clock is behind stamps a request it has
+		// just created with a time before the transition. Recycling on
+		// failureTime alone would recreate it every round with no failure
+		// recorded to pace it.
+		"should do nothing if the incomplete CertificateRequest was created during this issuance but stamped with an older failureTime": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue, LastTransitionTime: &fixedNow}),
+				gen.SetCertificateRevision(5),
+			),
+			requests: []runtime.Object{
+				incompleteRequest(fixedNow.Time.Add(-time.Hour), fixedNow.Time.Add(2*time.Second)),
+			},
+		},
+		// Denied and InvalidRequest are decisions of their own: a replacement
+		// only gets the same answer, so they are not recycled here.
+		"should do nothing if the CertificateRequest with no Ready condition and an older failureTime is denied": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue, LastTransitionTime: &fixedNow}),
+				gen.SetCertificateRevision(5),
+			),
+			requests: []runtime.Object{
+				incompleteRequest(fixedNow.Time.Add(-time.Hour), fixedNow.Time.Add(-2*time.Hour),
+					gen.AddCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
+						Type: cmapi.CertificateRequestConditionDenied, Status: cmmeta.ConditionTrue, Reason: "DeniedReason",
+					}),
+				),
+			},
+		},
+		"should do nothing if the CertificateRequest with no Ready condition and an older failureTime is invalid": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle1.certificate, "exists"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle1.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle1.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue, LastTransitionTime: &fixedNow}),
+				gen.SetCertificateRevision(5),
+			),
+			requests: []runtime.Object{
+				incompleteRequest(fixedNow.Time.Add(-time.Hour), fixedNow.Time.Add(-2*time.Hour),
+					gen.AddCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
+						Type: cmapi.CertificateRequestConditionInvalidRequest, Status: cmmeta.ConditionTrue, Reason: "InvalidRequest",
+					}),
+				),
+			},
+		},
+		"record a Warning event if CSR generation fails, e.g. due to a malformed NameConstraints IP range": {
+			featuresFlags: map[featuregate.Feature]bool{
+				feature.NameConstraints: true,
+			},
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle3.certificate, "exists-for-nameconstraints-test"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: bundle3.privateKeyBytes},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle3.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists-for-nameconstraints-test"),
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+				gen.SetCertificateIsCA(true),
+				func(crt *cmapi.Certificate) {
+					crt.Spec.NameConstraints = &cmapi.NameConstraints{
+						Critical: true,
+						Permitted: &cmapi.NameConstraintItem{
+							// Missing the required "/prefix" - not a valid CIDR.
+							IPRanges: []string{"10.0.0.0"},
+						},
+					}
+				},
+			),
+			expectedEvents: []string{
+				`Warning RequestFailed Failed to generate CSR: invalid CIDR address: 10.0.0.0 - will not retry`,
+			},
+		},
+		// The keymanager regenerates a next private key that does not match the
+		// spec, so this controller must not act on it: no CertificateRequest is
+		// created, no event is recorded and no error is returned. Without the
+		// guard, the CSR would be built and pki.EncodeCSR would fail on every
+		// reconcile.
+		"do nothing if the next private key does not match spec.privateKey.algorithm, waiting for the keymanager": {
+			secrets: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: nextPrivateKeySecretMeta(bundle3.certificate, "exists-with-mismatched-key"),
+					Data:       map[string][]byte{corev1.TLSPrivateKeyKey: mustGenerateECDSA(t)},
+				},
+			},
+			certificate: gen.CertificateFrom(bundle3.certificate,
+				gen.SetCertificateNextPrivateKeySecretName("exists-with-mismatched-key"),
+				func(crt *cmapi.Certificate) {
+					crt.Spec.PrivateKey = &cmapi.CertificatePrivateKey{Algorithm: cmapi.RSAKeyAlgorithm}
+				},
+				gen.SetCertificateStatusCondition(cmapi.CertificateCondition{Type: cmapi.CertificateConditionIssuing, Status: cmmeta.ConditionTrue}),
+			),
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Create and initialise a new unit test builder
+			builder := &testpkg.Builder{
+				T:               t,
+				ExpectedEvents:  test.expectedEvents,
+				ExpectedActions: test.expectedActions,
+				StringGenerator: func(i int) string { return "notrandom" },
+				Clock:           fixedClock,
+			}
+			if test.certificate != nil {
+				builder.CertManagerObjects = append(builder.CertManagerObjects, test.certificate)
+			}
+			if test.secrets != nil {
+				builder.KubeObjects = append(builder.KubeObjects, test.secrets...)
+			}
+			builder.CertManagerObjects = append(builder.CertManagerObjects, test.requests...)
+			builder.Init()
+
+			// Register informers used by the controller using the registration wrapper
+			w := &controllerWrapper{}
+			_, _, err := w.Register(builder.Context)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Enable any features for a particular test
+			for feature, value := range test.featuresFlags {
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, feature, value)
+			}
+
+			// Start the informers and begin processing updates
+			builder.Start()
+			defer builder.Stop()
+
+			key := test.key
+			if key == (types.NamespacedName{}) && test.certificate != nil {
+				key = types.NamespacedName{
+					Name:      test.certificate.Name,
+					Namespace: test.certificate.Namespace,
+				}
+			}
+
+			// Call ProcessItem
+			err = w.controller.ProcessItem(t.Context(), key)
+			switch {
+			case err != nil:
+				if test.err != err.Error() {
+					t.Errorf("error text did not match, got=%s, exp=%s", err.Error(), test.err)
+				}
+			default:
+				if test.err != "" {
+					t.Errorf("got no error but expected: %s", test.err)
+				}
+			}
+
+			if err := builder.AllEventsCalled(); err != nil {
+				builder.T.Error(err)
+			}
+			if err := builder.AllActionsExecuted(); err != nil {
+				builder.T.Error(err)
+			}
+		})
+	}
+}
+
+// If the CertificateRequest we just created never turns up in our own lister,
+// createNewCertificateRequest returns an error so the item is retried. If the
+// lister is still stale on that retry, it can create a second
+// CertificateRequest for the same revision, which ProcessItem refuses to
+// resolve. The timeout is worth surfacing on the Certificate for that reason.
+func TestCreateNewCertificateRequestWaitTimeout(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, feature.StableCertificateRequestName, false)
+
+	bundle := mustCreateCryptoBundle(t, &cmapi.Certificate{
+		Namespace: "testns",
+		Name:      "test",
+		UID:       "test",
+		Spec:      cmapi.CertificateSpec{CommonName: "test-wait-timeout"},
+	})
+	pk, err := pki.DecodePrivateKeyBytes(bundle.privateKeyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	builder := &testpkg.Builder{
+		T:               t,
+		StringGenerator: func(i int) string { return "notrandom" },
+		ExpectedEvents: []string{
+			`Normal Requested Created new CertificateRequest resource "test-notrandom"`,
+			`Warning RequestFailed Failed waiting for CertificateRequest "test-notrandom" to be observed: context deadline exceeded - will retry`,
+		},
+		ExpectedActions: []testpkg.Action{
+			testpkg.NewCustomMatch(coretesting.NewCreateAction(cmapi.SchemeGroupVersion.WithResource("certificaterequests"), "testns",
+				gen.CertificateRequestFrom(bundle.certificateRequest,
+					// The create action records the object as submitted, i.e.
+					// before the apiserver expands generateName.
+					gen.SetCertificateRequestName(""),
+					func(cr *cmapi.CertificateRequest) { cr.GenerateName = "test-" },
+					gen.SetCertificateRequestAnnotations(map[string]string{
+						cmapi.CertificateRequestPrivateKeyAnnotationKey: "exists",
+						cmapi.CertificateRequestRevisionAnnotationKey:   "1",
+					}),
+				)), relaxedCertificateRequestMatcher),
+		},
+	}
+	builder.Init()
+
+	w := &controllerWrapper{}
+	if _, _, err := w.Register(builder.Context); err != nil {
+		t.Fatal(err)
+	}
+	// The informers are deliberately never started, so the CertificateRequest
+	// lister never observes the CertificateRequest created below - exactly what
+	// a lagging informer looks like to the controller.
+	defer builder.Stop()
+
+	// Cut the 5s poll short rather than making the test wait for it; the poll
+	// honours the parent context.
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	// gen.CertificateFrom applies the API defaults, so that the created
+	// CertificateRequest matches the defaulted fixture below.
+	err = w.controller.createNewCertificateRequest(ctx, gen.CertificateFrom(bundle.certificate), pk, 1, "exists")
+	if err == nil {
+		t.Fatal("expected an error but got none")
+	}
+	if !strings.Contains(err.Error(), `failed whilst waiting for CertificateRequest "test-notrandom" to be observed`) {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if err := builder.AllEventsCalled(); err != nil {
+		t.Error(err)
+	}
+	if err := builder.AllActionsExecuted(); err != nil {
+		t.Error(err)
+	}
+}

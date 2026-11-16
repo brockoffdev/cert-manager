@@ -1,196 +1,168 @@
+/*
+Copyright 2020 The cert-manager Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package clusterissuers
 
 import (
 	"context"
 	"fmt"
-	"sync"
-	"time"
 
-	"github.com/golang/glog"
-	corev1 "k8s.io/api/core/v1"
+	"github.com/go-logr/logr"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
-	coreinformers "k8s.io/client-go/informers/core/v1"
-	"k8s.io/client-go/kubernetes"
-	corelisters "k8s.io/client-go/listers/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 
-	clientset "github.com/jetstack/cert-manager/pkg/client/clientset/versioned"
-	cminformers "github.com/jetstack/cert-manager/pkg/client/informers/externalversions/certmanager/v1alpha1"
-	cmlisters "github.com/jetstack/cert-manager/pkg/client/listers/certmanager/v1alpha1"
-	controllerpkg "github.com/jetstack/cert-manager/pkg/controller"
-	"github.com/jetstack/cert-manager/pkg/issuer"
-	"github.com/jetstack/cert-manager/pkg/util"
+	internalinformers "github.com/cert-manager/cert-manager/internal/informers"
+	cmclient "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
+	cmlisters "github.com/cert-manager/cert-manager/pkg/client/listers/certmanager/v1"
+	controllerpkg "github.com/cert-manager/cert-manager/pkg/controller"
+	"github.com/cert-manager/cert-manager/pkg/issuer"
+	logf "github.com/cert-manager/cert-manager/pkg/logs"
 )
 
-type Controller struct {
-	client        kubernetes.Interface
-	cmClient      clientset.Interface
+type controller struct {
+	clusterIssuerLister cmlisters.ClusterIssuerLister
+	secretLister        internalinformers.SecretLister
+
+	// maintain a reference to the workqueue for this controller
+	// so the handleOwnedResource method can enqueue resources
+	queue workqueue.TypedRateLimitingInterface[types.NamespacedName]
+
+	// logger to be used by this controller
+	log logr.Logger
+
+	// clientset used to update cert-manager API resources
+	cmClient cmclient.Interface
+
+	// used to record Events about resources to the API
+	recorder record.EventRecorder
+
+	// issuerFactory is used to obtain a reference to the Issuer implementation
+	// for each ClusterIssuer resource
 	issuerFactory issuer.Factory
-	recorder      record.EventRecorder
 
-	// To allow injection for testing.
-	syncHandler func(ctx context.Context, key string) error
-
-	issuerInformerSynced cache.InformerSynced
-	issuerLister         cmlisters.ClusterIssuerLister
-
-	secretInformerSynced cache.InformerSynced
-	secretLister         corelisters.SecretLister
-
-	queue                    workqueue.RateLimitingInterface
-	workerWg                 sync.WaitGroup
+	// clusterResourceNamespace is the namespace used to store resources
+	// referenced by ClusterIssuer resources, e.g., acme account secrets
 	clusterResourceNamespace string
+
+	// fieldManager is the manager name used for the Apply operations.
+	fieldManager string
 }
 
-func New(
-	clusterIssuersInformer cminformers.ClusterIssuerInformer,
-	secretsInformer coreinformers.SecretInformer,
-	cl kubernetes.Interface,
-	cmClient clientset.Interface,
-	issuerFactory issuer.Factory,
-	recorder record.EventRecorder,
-	clusterResourceNamespace string,
-) *Controller {
-	ctrl := &Controller{client: cl, cmClient: cmClient, issuerFactory: issuerFactory, recorder: recorder, clusterResourceNamespace: clusterResourceNamespace}
-	ctrl.syncHandler = ctrl.processNextWorkItem
-	ctrl.queue = workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "clusterissuers")
+// Register registers and constructs the controller using the provided context.
+// It returns the workqueue to be used to enqueue items, a list of
+// InformerSynced functions that must be synced, or an error.
+func (c *controller) Register(ctx *controllerpkg.Context) (workqueue.TypedRateLimitingInterface[types.NamespacedName], []cache.InformerSynced, error) {
+	// construct a new named logger to be reused throughout the controller
+	c.log = logf.FromContext(ctx.RootContext, ControllerName)
 
-	clusterIssuersInformer.Informer().AddEventHandler(&controllerpkg.QueuingEventHandler{Queue: ctrl.queue})
-	ctrl.issuerInformerSynced = clusterIssuersInformer.Informer().HasSynced
-	ctrl.issuerLister = clusterIssuersInformer.Lister()
+	// create a queue used to queue up items to be processed
+	c.queue = workqueue.NewTypedRateLimitingQueueWithConfig(
+		controllerpkg.DefaultItemBasedRateLimiter(),
+		workqueue.TypedRateLimitingQueueConfig[types.NamespacedName]{
+			Name: ControllerName,
+		},
+	)
 
-	secretsInformer.Informer().AddEventHandler(&controllerpkg.BlockingEventHandler{WorkFunc: ctrl.secretDeleted})
-	ctrl.secretInformerSynced = secretsInformer.Informer().HasSynced
-	ctrl.secretLister = secretsInformer.Lister()
+	// obtain references to all the informers used by this controller
+	clusterIssuerInformer := ctx.SharedInformerFactory.Certmanager().V1().ClusterIssuers()
+	secretInformer := ctx.KubeSharedInformerFactory.Secrets()
+	// build a list of InformerSynced functions that will be returned by the Register method.
+	// the controller will only begin processing items once all of these informers have synced.
+	mustSync := []cache.InformerSynced{
+		clusterIssuerInformer.Informer().HasSynced,
+		secretInformer.Informer().HasSynced,
+	}
 
-	return ctrl
+	// set all the references to the listers for used by the Sync function
+	c.clusterIssuerLister = clusterIssuerInformer.Lister()
+	c.secretLister = secretInformer.Lister()
+
+	// register handler functions
+	if _, err := clusterIssuerInformer.Informer().AddEventHandler(controllerpkg.QueuingEventHandler(c.queue)); err != nil {
+		return nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
+	if _, err := secretInformer.Informer().AddEventHandler(controllerpkg.BlockingEventHandler(c.secretEvent)); err != nil {
+		return nil, nil, fmt.Errorf("error setting up event handler: %v", err)
+	}
+
+	// instantiate additional helpers used by this controller
+	c.issuerFactory = issuer.NewFactory(ctx)
+	c.cmClient = ctx.CMClient
+	c.fieldManager = ctx.FieldManager
+	c.recorder = ctx.Recorder
+	c.clusterResourceNamespace = ctx.IssuerOptions.ClusterResourceNamespace
+
+	return c.queue, mustSync, nil
 }
 
-// TODO: replace with generic handleObjet function (like Navigator)
-func (c *Controller) secretDeleted(obj interface{}) {
-	var secret *corev1.Secret
-	var ok bool
-	secret, ok = obj.(*corev1.Secret)
+// TODO: replace with generic handleObject function (like Navigator)
+func (c *controller) secretEvent(obj metav1.Object) {
+	log := c.log.WithName("secretEvent")
+
+	secret, ok := controllerpkg.ToSecret(obj)
 	if !ok {
-		runtime.HandleError(fmt.Errorf("Object was not a Secret object %#v", obj))
+		log.Error(nil, "object is not a secret", "object", obj)
 		return
 	}
+	log = logf.WithResource(log, secret)
+
 	issuers, err := c.issuersForSecret(secret)
 	if err != nil {
-		runtime.HandleError(fmt.Errorf("Error looking up issuers observing Secret: %s/%s", secret.Namespace, secret.Name))
+		log.Error(err, "error looking up issuers observing secret")
 		return
 	}
 	for _, iss := range issuers {
-		key, err := keyFunc(iss)
-		if err != nil {
-			runtime.HandleError(err)
-			continue
-		}
-		c.queue.AddRateLimited(key)
+		c.queue.Add(types.NamespacedName{
+			Name:      iss.Name,
+			Namespace: iss.Namespace,
+		})
 	}
 }
 
-func (c *Controller) Run(workers int, stopCh <-chan struct{}) error {
-	glog.V(4).Infof("Starting %s control loop", ControllerName)
-	// wait for all the informer caches we depend on are synced
-	if !cache.WaitForCacheSync(stopCh, c.issuerInformerSynced, c.secretInformerSynced) {
-		// TODO: replace with Errorf call to glog
-		return fmt.Errorf("error waiting for informer caches to sync")
+func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) error {
+	log := logf.FromContext(ctx)
+
+	name := key.Name
+
+	issuer, err := c.clusterIssuerLister.Get(name)
+	if err != nil && !k8sErrors.IsNotFound(err) {
+		return err
 	}
-
-	for i := 0; i < workers; i++ {
-		c.workerWg.Add(1)
-		// TODO (@munnerz): make time.Second duration configurable
-		go wait.Until(func() { c.worker(stopCh) }, time.Second, stopCh)
-	}
-	<-stopCh
-	glog.V(4).Infof("Shutting down queue as workqueue signaled shutdown")
-	c.queue.ShutDown()
-	glog.V(4).Infof("Waiting for workers to exit...")
-	c.workerWg.Wait()
-	glog.V(4).Infof("Workers exited.")
-	return nil
-}
-
-func (c *Controller) worker(stopCh <-chan struct{}) {
-	defer c.workerWg.Done()
-	glog.V(4).Infof("Starting %q worker", ControllerName)
-	for {
-		obj, shutdown := c.queue.Get()
-		if shutdown {
-			break
-		}
-
-		var key string
-		err := func(obj interface{}) error {
-			defer c.queue.Done(obj)
-			var ok bool
-			if key, ok = obj.(string); !ok {
-				return nil
-			}
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			ctx = util.ContextWithStopCh(ctx, stopCh)
-			glog.Infof("%s controller: syncing item '%s'", ControllerName, key)
-			if err := c.syncHandler(ctx, key); err != nil {
-				return err
-			}
-			c.queue.Forget(obj)
-			return nil
-		}(obj)
-
-		if err != nil {
-			glog.Errorf("%s controller: Re-queuing item %q due to error processing: %s", ControllerName, key, err.Error())
-			c.queue.AddRateLimited(obj)
-			continue
-		}
-
-		glog.Infof("%s controller: Finished processing work item %q", ControllerName, key)
-	}
-	glog.V(4).Infof("Exiting %q worker loop", ControllerName)
-}
-
-func (c *Controller) processNextWorkItem(ctx context.Context, key string) error {
-	_, name, err := cache.SplitMetaNamespaceKey(key)
-	if err != nil {
-		runtime.HandleError(fmt.Errorf("invalid resource key: %s", key))
+	if issuer == nil || issuer.DeletionTimestamp != nil {
+		// If the ClusterIssuer object was/ is being deleted, we don't want to update its status.
 		return nil
 	}
 
-	issuer, err := c.issuerLister.Get(name)
-
-	if err != nil {
-		if k8sErrors.IsNotFound(err) {
-			runtime.HandleError(fmt.Errorf("issuer %q in work queue no longer exists", key))
-			return nil
-		}
-
-		return err
-	}
-
+	ctx = logf.NewContext(ctx, logf.WithResource(log, issuer))
 	return c.Sync(ctx, issuer)
 }
 
-var keyFunc = controllerpkg.KeyFunc
-
 const (
+	// ControllerName is the name of the ClusterIssuers controller.
 	ControllerName = "clusterissuers"
 )
 
 func init() {
-	controllerpkg.Register(ControllerName, func(ctx *controllerpkg.Context) controllerpkg.Interface {
-		return New(
-			ctx.SharedInformerFactory.Certmanager().V1alpha1().ClusterIssuers(),
-			ctx.KubeSharedInformerFactory.Core().V1().Secrets(),
-			ctx.Client,
-			ctx.CMClient,
-			ctx.IssuerFactory,
-			ctx.Recorder,
-			ctx.ClusterResourceNamespace,
-		).Run
+	controllerpkg.Register(ControllerName, func(ctx *controllerpkg.ContextFactory) (controllerpkg.Interface, error) {
+		return controllerpkg.NewBuilder(ctx, ControllerName).
+			For(&controller{}).
+			Complete()
 	})
 }

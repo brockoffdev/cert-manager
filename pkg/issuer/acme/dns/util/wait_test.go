@@ -1,166 +1,401 @@
+//go:build !livedns_test
+
+// +skip_license_check
+
+/*
+This file contains portions of code directly taken from the 'xenolf/lego' project.
+A copy of the license for this code can be found in the file named LICENSE in
+this directory.
+*/
+
 package util
 
 import (
-	"reflect"
-	"sort"
-	"strings"
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/miekg/dns"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-var lookupNameserversTestsOK = []struct {
-	fqdn string
-	nss  []string
-}{
-	{"books.google.com.ng.",
-		[]string{"ns1.google.com.", "ns2.google.com.", "ns3.google.com.", "ns4.google.com."},
-	},
-	{"www.google.com.",
-		[]string{"ns1.google.com.", "ns2.google.com.", "ns3.google.com.", "ns4.google.com."},
-	},
-	{"physics.georgetown.edu.",
-		[]string{"ns1.georgetown.edu.", "ns2.georgetown.edu.", "ns3.georgetown.edu."},
-	},
-}
+func TestWaitForStopsWhenContextIsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
 
-var lookupNameserversTestsErr = []struct {
-	fqdn  string
-	error string
-}{
-	// invalid tld
-	{"_null.n0n0.",
-		"Could not determine the zone",
-	},
-}
+	start := time.Now()
+	err := WaitFor(ctx, time.Minute, 2*time.Second, func() (bool, error) {
+		cancel()
+		return false, nil
+	})
 
-var findZoneByFqdnTests = []struct {
-	fqdn string
-	zone string
-}{
-	{"mail.google.com.", "google.com."},             // domain is a CNAME
-	{"foo.google.com.", "google.com."},              // domain is a non-existent subdomain
-	{"example.com.ac.", "ac."},                      // domain is a eTLD
-	{"cross-zone-example.assets.sh.", "assets.sh."}, // domain is a cross-zone CNAME
-}
-
-var checkAuthoritativeNssTests = []struct {
-	fqdn, value string
-	ns          []string
-	ok          bool
-}{
-	// TXT RR w/ expected value
-	{"8.8.8.8.asn.routeviews.org.", "151698.8.8.024", []string{"asnums.routeviews.org."},
-		true,
-	},
-	// No TXT RR
-	{"ns1.google.com.", "", []string{"ns2.google.com."},
-		false,
-	},
-	// TXT RR /w unexpected value
-	{"8.8.8.8.asn.routeviews.org.", "fe01=", []string{"asnums.routeviews.org."},
-		false,
-	},
-}
-
-var checkAuthoritativeNssTestsErr = []struct {
-	fqdn, value string
-	ns          []string
-	error       string
-}{
-	// invalid nameserver
-	{"8.8.8.8.asn.routeviews.org.", "fe01=", []string{"invalidns.com."},
-		"",
-	},
-}
-
-var checkResolvConfServersTests = []struct {
-	fixture  string
-	expected []string
-	defaults []string
-}{
-	{"testdata/resolv.conf.1", []string{"10.200.3.249:53", "10.200.3.250:5353", "[2001:4860:4860::8844]:53", "[10.0.0.1]:5353"}, []string{"127.0.0.1:53"}},
-	{"testdata/resolv.conf.nonexistant", []string{"127.0.0.1:53"}, []string{"127.0.0.1:53"}},
-}
-
-func TestPreCheckDNS(t *testing.T) {
-	// TODO: find a better TXT record to use in tests
-	ok, err := PreCheckDNS("google.com.", "v=spf1 include:_spf.google.com ~all")
-	if err != nil || !ok {
-		t.Errorf("preCheckDNS failed for acme-staging.api.letsencrypt.org: %s", err.Error())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
 	}
-}
-
-func TestLookupNameserversOK(t *testing.T) {
-	for _, tt := range lookupNameserversTestsOK {
-		nss, err := lookupNameservers(tt.fqdn)
-		if err != nil {
-			t.Fatalf("#%s: got %q; want nil", tt.fqdn, err)
-		}
-
-		sort.Strings(nss)
-		sort.Strings(tt.nss)
-
-		if !reflect.DeepEqual(nss, tt.nss) {
-			t.Errorf("#%s: got %v; want %v", tt.fqdn, nss, tt.nss)
-		}
-	}
-}
-
-func TestLookupNameserversErr(t *testing.T) {
-	for _, tt := range lookupNameserversTestsErr {
-		_, err := lookupNameservers(tt.fqdn)
-		if err == nil {
-			t.Fatalf("#%s: expected %q (error); got <nil>", tt.fqdn, tt.error)
-		}
-
-		if !strings.Contains(err.Error(), tt.error) {
-			t.Errorf("#%s: expected %q (error); got %q", tt.fqdn, tt.error, err)
-			continue
-		}
+	if elapsed := time.Since(start); elapsed >= 2*time.Second {
+		t.Errorf("WaitFor did not stop promptly after cancellation: %s", elapsed)
 	}
 }
 
 func TestFindZoneByFqdn(t *testing.T) {
-	for _, tt := range findZoneByFqdnTests {
-		res, err := FindZoneByFqdn(tt.fqdn, RecursiveNameservers)
-		if err != nil {
-			t.Errorf("FindZoneByFqdn failed for %s: %v", tt.fqdn, err)
-		}
-		if res != tt.zone {
-			t.Errorf("%s: got %s; want %s", tt.fqdn, res, tt.zone)
-		}
+	tests := []struct {
+		givenFQDN  string
+		mockDNS    []interaction
+		expectZone string
+	}{
+		{
+			// In this test, we make sure that we are able to recurse up to
+			// google.com given that it is a CNAME that points to
+			// googlemail.l.google.com. Data from 2021-04-17:
+			// https://dnsviz.net/d/mail.google.com/YHtmLQ/responses/
+			givenFQDN:  "mail.google.com.",
+			expectZone: "google.com.",
+			mockDNS: []interaction{
+				{"SOA mail.google.com.", &dns.Msg{
+					Rcode: dns.RcodeSuccess,
+					Answer: []dns.RR{
+						&dns.CNAME{Hdr: dns.RR_Header{Name: "mail.google.com.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 604800}, Target: "googlemail.l.google.com."},
+					},
+					Ns: []dns.RR{
+						&dns.SOA{Hdr: dns.RR_Header{Name: "google.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 300}, Ns: "ns1.google.com.", Mbox: "dns-admin.google.com.", Serial: 754990191, Refresh: 900, Retry: 900, Expire: 1800, Minttl: 60},
+					},
+				}},
+				{"SOA google.com.", &dns.Msg{
+					Rcode: dns.RcodeSuccess,
+					Answer: []dns.RR{
+						&dns.SOA{Hdr: dns.RR_Header{Name: "google.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 32}, Ns: "ns1.google.com.", Mbox: "dns-admin.google.com.", Serial: 754990191, Refresh: 900, Retry: 900, Expire: 1800, Minttl: 60},
+					},
+				}},
+			},
+		},
+		{
+			// This test checks that we do not return SOA records that are not a
+			// suffix of the domain. In the below test, the SOA RR `example.com`
+			// must be ignored. We detect such a case by ignoring SOA that are
+			// returned alongside CNAME records. This is a consequence of RFC
+			// 2181 that states that CNAME records cannot exist at the root of a
+			// zone. See: https://github.com/go-acme/lego/pull/449.
+			givenFQDN:  "cross-zone-example.assets.sh.",
+			expectZone: "assets.sh.",
+			mockDNS: []interaction{
+				{"SOA cross-zone-example.assets.sh.", &dns.Msg{
+					Rcode: dns.RcodeSuccess,
+					Answer: []dns.RR{
+						&dns.CNAME{Hdr: dns.RR_Header{Name: "cross-zone-example.assets.sh.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 300}, Target: "example.com."},
+						&dns.SOA{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 2633}, Ns: "ns.icann.org.", Mbox: "noc.dns.icann.org.", Serial: 2025011636, Refresh: 7200, Retry: 3600, Expire: 1209600, Minttl: 3600},
+					},
+				}},
+				{"SOA assets.sh.", &dns.Msg{
+					Rcode: dns.RcodeSuccess,
+					Answer: []dns.RR{
+						&dns.SOA{Hdr: dns.RR_Header{Name: "assets.sh.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 979}, Ns: "gina.ns.cloudflare.com.", Mbox: "dns.cloudflare.com.", Serial: 2371821451, Refresh: 10000, Retry: 2400, Expire: 604800, Minttl: 1800},
+					},
+				}},
+			},
+		},
+		{
+			// This test shows that FindZoneByFqdn can work is able to continue
+			// climbing up the tree when a non-existent domain is found. We do
+			// this because the `_acme-challenge` subdomain may not exist yet,
+			// but we still want to find the zone for the domain.
+			givenFQDN:  "nonexistent.cert-manager.io.",
+			expectZone: "cert-manager.io.",
+			mockDNS: []interaction{
+				{"SOA nonexistent.cert-manager.io.", &dns.Msg{
+					Rcode: dns.RcodeNameError, // NXDOMAIN
+					Ns: []dns.RR{
+						&dns.SOA{Hdr: dns.RR_Header{Name: "cert-manager.io.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 21}, Ns: "ns-cloud-a1.googledomains.com.", Mbox: "cloud-dns-hostmaster.google.com.", Serial: 2, Refresh: 21600, Retry: 3600, Expire: 259200, Minttl: 300},
+					},
+				}},
+				{"SOA cert-manager.io.", &dns.Msg{
+					Rcode: dns.RcodeSuccess,
+					Answer: []dns.RR{
+						&dns.SOA{Hdr: dns.RR_Header{Name: "cert-manager.io.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 31}, Ns: "ns-cloud-a1.googledomains.com.", Mbox: "cloud-dns-hostmaster.google.com.", Serial: 2, Refresh: 21600, Retry: 3600, Expire: 259200, Minttl: 300},
+					},
+				}},
+			},
+		},
+		{
+			// This test shows that FindZoneByFqdn works with eTLD domains
+			// (effective top-level domain).
+			givenFQDN:  "example.com.ac.",
+			expectZone: "ac.",
+			mockDNS: []interaction{
+				{"SOA example.com.ac.", &dns.Msg{
+					Rcode: dns.RcodeNameError, // NXDOMAIN
+					Ns: []dns.RR{
+						&dns.SOA{Hdr: dns.RR_Header{Name: "ac.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 3500}, Ns: "a0.nic.ac", Mbox: "hostmaster.donuts.email", Serial: 1746448794, Refresh: 7200, Retry: 900, Expire: 1209600, Minttl: 3600},
+					},
+				}},
+				{"SOA com.ac.", &dns.Msg{
+					Rcode: dns.RcodeNameError, // NXDOMAIN
+					Ns: []dns.RR{
+						&dns.SOA{Hdr: dns.RR_Header{Name: "ac.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 3496}, Ns: "a0.nic.ac", Mbox: "hostmaster.donuts.email", Serial: 1746448794, Refresh: 7200, Retry: 900, Expire: 1209600, Minttl: 3600},
+					},
+				}},
+				{"SOA ac.", &dns.Msg{
+					Rcode: dns.RcodeSuccess,
+					Answer: []dns.RR{
+						&dns.SOA{Hdr: dns.RR_Header{Name: "ac.", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 3486}, Ns: "a0.nic.ac", Mbox: "hostmaster.donuts.email", Serial: 1746448794, Refresh: 7200, Retry: 900, Expire: 1209600, Minttl: 3600},
+					},
+				}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.givenFQDN, func(t *testing.T) {
+			withMockDNSQuery(t, tt.mockDNS)
+			gotZone, err := FindZoneByFqdn(t.Context(), tt.givenFQDN, []string{"not-used"})
+			require.NoError(t, err)
+			assert.Equal(t, tt.expectZone, gotZone)
+		})
 	}
 }
 
 func TestCheckAuthoritativeNss(t *testing.T) {
-	for _, tt := range checkAuthoritativeNssTests {
-		ok, _ := checkAuthoritativeNss(tt.fqdn, tt.value, tt.ns)
-		if ok != tt.ok {
-			t.Errorf("%s: got %t; want %t", tt.fqdn, ok, tt.ok)
-		}
-	}
+	t.Run("happy path", func(t *testing.T) {
+		withMockDNSQuery(t, []interaction{
+			{"TXT 8.8.8.8.asn.routeviews.org.", &dns.Msg{
+				Rcode: dns.RcodeSuccess,
+				Answer: []dns.RR{
+					&dns.TXT{Hdr: dns.RR_Header{Name: "8.8.8.8.asn.routeviews.org.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 300}, Txt: []string{"fe01="}},
+				},
+			}},
+		})
+		ok, err := checkAuthoritativeNss(t.Context(), "8.8.8.8.asn.routeviews.org.", "fe01=", []string{"1.1.1.1:53"})
+		require.NoError(t, err)
+		assert.True(t, ok)
+	})
+
+	t.Run("TXT not found", func(t *testing.T) {
+		withMockDNSQuery(t, []interaction{
+			{"TXT 8.8.8.8.asn.routeviews.org.", &dns.Msg{
+				Rcode: dns.RcodeNameError,
+			}},
+		})
+		ok, err := checkAuthoritativeNss(t.Context(), "8.8.8.8.asn.routeviews.org.", "fe01=", []string{"1.1.1.1:53"})
+		require.NoError(t, err)
+		assert.False(t, ok)
+	})
+
+	t.Run("errors out when DnsQuery fails", func(t *testing.T) {
+		withMockDNSQueryErr(t, fmt.Errorf("some error coming from DnsQuery"))
+
+		_, err := checkAuthoritativeNss(t.Context(), "8.8.8.8.asn.routeviews.org.", "fe01=", []string{"1.1.1.1:53"})
+		assert.EqualError(t, err, "some error coming from DnsQuery")
+	})
 }
 
-func TestCheckAuthoritativeNssErr(t *testing.T) {
-	for _, tt := range checkAuthoritativeNssTestsErr {
-		_, err := checkAuthoritativeNss(tt.fqdn, tt.value, tt.ns)
-		if err == nil {
-			t.Fatalf("#%s: expected %q (error); got <nil>", tt.fqdn, tt.error)
-		}
-		if !strings.Contains(err.Error(), tt.error) {
-			t.Errorf("#%s: expected %q (error); got %q", tt.fqdn, tt.error, err)
-			continue
-		}
-	}
-}
-
+// These tests don't require mocking out dnsQuery as getNameservers doesn't rely
+// on it.
 func TestResolveConfServers(t *testing.T) {
+	checkResolvConfServersTests := []struct {
+		fixture  string
+		expected []string
+		defaults []string
+	}{
+		{"testdata/resolv.conf.1", []string{"10.200.3.249:53", "10.200.3.250:5353", "[2001:4860:4860::8844]:53", "[10.0.0.1]:5353"}, []string{"127.0.0.1:53"}},
+		{"testdata/resolv.conf.nonexistent", []string{"127.0.0.1:53"}, []string{"127.0.0.1:53"}},
+	}
 	for _, tt := range checkResolvConfServersTests {
 		result := getNameservers(tt.fixture, tt.defaults)
 
-		sort.Strings(result)
-		sort.Strings(tt.expected)
-		if !reflect.DeepEqual(result, tt.expected) {
-			t.Errorf("#%s: expected %q; got %q", tt.fixture, tt.expected, result)
+		assert.ElementsMatch(t, tt.expected, result, "#%s", tt.fixture)
+	}
+}
+
+func Test_followCNAMEs(t *testing.T) {
+	type args struct {
+		fqdn        string
+		nameservers []string
+		fqdnChain   []string
+	}
+	tests := []struct {
+		name    string
+		mock    []interaction
+		args    args
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "Resolve CNAME 3 down",
+			args: args{
+				fqdn: "test1.example.com.",
+			},
+			want:    "test3.example.com.",
+			wantErr: false,
+			mock: []interaction{
+				{"CNAME test1.example.com.", &dns.Msg{
+					Rcode: dns.RcodeSuccess,
+					Answer: []dns.RR{
+						&dns.CNAME{Hdr: dns.RR_Header{Name: "test1.example.com.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 300}, Target: "test2.example.com."},
+					},
+				}},
+				{"CNAME test2.example.com.", &dns.Msg{
+					Rcode: dns.RcodeSuccess,
+					Answer: []dns.RR{
+						&dns.CNAME{Hdr: dns.RR_Header{Name: "test2.example.com.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 300}, Target: "test3.example.com."},
+					},
+				}},
+				{"CNAME test3.example.com.", &dns.Msg{
+					Rcode:  dns.RcodeSuccess,
+					Answer: []dns.RR{},
+				}},
+			},
+		},
+		{
+			name: "Resolve CNAME 1 down",
+			args: args{
+				fqdn: "test3.example.com.",
+			},
+			want:    "test3.example.com.",
+			wantErr: false,
+			mock: []interaction{
+				{"CNAME test3.example.com.", &dns.Msg{
+					Rcode:  dns.RcodeSuccess,
+					Answer: []dns.RR{},
+				}},
+			},
+		},
+		{
+			name: "Return fqdn unchanged on NXDOMAIN",
+			args: args{
+				fqdn: "missing.example.com.",
+			},
+			want:    "missing.example.com.",
+			wantErr: false,
+			mock: []interaction{
+				{"CNAME missing.example.com.", &dns.Msg{
+					Rcode: dns.RcodeNameError,
+				}},
+			},
+		},
+		{
+			name: "Error on SERVFAIL",
+			args: args{
+				fqdn: "broken.example.com.",
+			},
+			wantErr: true,
+			mock: []interaction{
+				{"CNAME broken.example.com.", &dns.Msg{
+					Rcode: dns.RcodeServerFailure,
+				}},
+			},
+		},
+		{
+			name: "Error on REFUSED",
+			args: args{
+				fqdn: "refused.example.com.",
+			},
+			wantErr: true,
+			mock: []interaction{
+				{"CNAME refused.example.com.", &dns.Msg{
+					Rcode: dns.RcodeRefused,
+				}},
+			},
+		},
+		{
+			name: "Error on recursive CNAME",
+			args: args{
+				fqdn: "recursive.example.com.",
+			},
+			wantErr: true,
+			mock: []interaction{
+				{"CNAME recursive.example.com.", &dns.Msg{
+					Rcode: dns.RcodeSuccess,
+					Answer: []dns.RR{
+						&dns.CNAME{Hdr: dns.RR_Header{Name: "recursive.example.com.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 300}, Target: "recursive1.example.com."},
+					},
+				}},
+				{"CNAME recursive1.example.com.", &dns.Msg{
+					Rcode: dns.RcodeSuccess,
+					Answer: []dns.RR{
+						&dns.CNAME{Hdr: dns.RR_Header{Name: "recursive1.example.com.", Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 300}, Target: "recursive.example.com."},
+					},
+				}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withMockDNSQuery(t, tt.mock)
+			got, err := followCNAMEs(t.Context(), tt.args.fqdn, tt.args.nameservers, tt.args.fqdnChain...)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("followCNAMEs() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("followCNAMEs() got = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+type interaction struct {
+	expectedQuery string // E.g., "SOA en.wikipedia.org."
+	mockAnswer    *dns.Msg
+}
+
+var mu = &sync.Mutex{} // Protects the global dnsQuery variable.
+
+func withMockDNSQuery(t *testing.T, mockDNS []interaction) {
+	withMockDNSQueryFailing(t, mockDNS, "", nil)
+}
+
+// Same as above, except that any query equal to failQuery returns failErr
+// instead of consuming a mocked interaction.
+func withMockDNSQueryFailing(t *testing.T, mockDNS []interaction, failQuery string, failErr error) {
+	mu.Lock()
+	t.Cleanup(func() {
+		mu.Unlock()
+	})
+
+	// Since dnsQuery is a global variable, we need to save its original value
+	// and restore it after the test.
+	origDNSQuery := dnsQuery
+	t.Cleanup(func() { dnsQuery = origDNSQuery })
+
+	count := atomic.Int32{}
+	t.Cleanup(func() {
+		assert.Equal(t, len(mockDNS), int(count.Load()), "not all DNS queries were called")
+	})
+
+	dnsQuery = func(ctx context.Context, fqdn string, rtype uint16, nameservers []string, recursive bool) (in *dns.Msg, err error) {
+		got := dns.TypeToString[rtype] + " " + fqdn
+
+		if failQuery != "" && got == failQuery {
+			return nil, failErr
 		}
+
+		count.Add(1)
+		if int(count.Load()) > len(mockDNS) {
+			t.Fatalf("too many DNS queries, was expecting %d queries but got %d. The unexpected query is: %s", len(mockDNS), count.Load(), got)
+		}
+
+		mock := mockDNS[count.Load()-1]
+		assert.Equal(t, mock.expectedQuery, got, "DNS query doesn't match the expected query #%d", count.Load())
+		return mock.mockAnswer.Copy().SetQuestion(fqdn, rtype), nil
+	}
+}
+
+// Same as above except it simulates an error.
+func withMockDNSQueryErr(t *testing.T, err error) {
+	mu.Lock()
+	t.Cleanup(func() {
+		mu.Unlock()
+	})
+
+	// Since dnsQuery is a global variable, we need to save its original value
+	// and restore it after the test.
+	origDNSQuery := dnsQuery
+	t.Cleanup(func() { dnsQuery = origDNSQuery })
+
+	dnsQuery = func(ctx context.Context, fqdn string, rtype uint16, nameservers []string, recursive bool) (in *dns.Msg, err2 error) {
+		return nil, err
 	}
 }

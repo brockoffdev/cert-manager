@@ -1,8 +1,6 @@
 approvers:
-- munnerz
-- kragniz
-- wallrj
+- cm-maintainers
 reviewers:
-- munnerz
-- kragniz
-- wallrj
+- cm-maintainers
+- ali-hamza-noor
+- lunarwhite

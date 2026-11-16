@@ -1,0 +1,372 @@
+/*
+Copyright 2020 The cert-manager Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package tls
+
+import (
+	"bytes"
+	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"fmt"
+	"math/big"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/cert-manager/cert-manager/pkg/server/tls/authority"
+	"github.com/cert-manager/cert-manager/pkg/util/pki"
+)
+
+// Integration tests for the DynamicSource can be found in `test/integration/webhook/dynamic_source_test.go`.
+
+func signUsingTempCA(t *testing.T, template *x509.Certificate) *x509.Certificate {
+	// generate random ca private key
+	caPrivateKey, err := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	caCRT := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Acme Co"},
+		},
+		NotBefore: time.Now(),
+		NotAfter:  time.Now().Add(time.Hour * 24 * 180),
+
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	_, cert, err := pki.SignCertificate(template, caCRT, template.PublicKey.(crypto.PublicKey), caPrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return cert
+}
+
+type mockAuthority struct {
+	doneCh   chan error
+	notifyCh chan<- struct{}
+	signFunc authority.SignFunc
+}
+
+func (m *mockAuthority) Run(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-m.doneCh:
+		return err
+	}
+}
+
+func (m *mockAuthority) WatchRotation(ch chan<- struct{}) {
+	m.notifyCh = ch
+}
+
+func (m *mockAuthority) StopWatchingRotation(ch chan<- struct{}) {}
+
+func (m *mockAuthority) Sign(template *x509.Certificate) (*x509.Certificate, error) {
+	return m.signFunc(template)
+}
+
+func TestDynamicSource_FailingSign(t *testing.T) {
+	type testCase struct {
+		name        string
+		signFunc    authority.SignFunc
+		testFn      func(t *testing.T, source *DynamicSource, mockAuth *mockAuthority)
+		expStartErr string
+	}
+
+	tests := []testCase{
+		{
+			name: "sign function returns error",
+			signFunc: func(template *x509.Certificate) (*x509.Certificate, error) {
+				return nil, fmt.Errorf("mock error")
+			},
+			testFn: func(t *testing.T, source *DynamicSource, mockAuth *mockAuthority) {
+				// Call the GetCertificate method, should return a non-ready error
+				cert, err := source.GetCertificate(&tls.ClientHelloInfo{})
+				assert.Nil(t, cert)
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), "no tls.Certificate available")
+
+				// The authority is now failing because of the faulty sign function,
+				// we now stop the authority and wait for the DynamicSource to stop
+				mockAuth.doneCh <- fmt.Errorf("mock error")
+			},
+			expStartErr: "mock error",
+		},
+		{
+			name: "certificate authority stopped unexpectedly",
+			signFunc: func(template *x509.Certificate) (*x509.Certificate, error) {
+				return nil, fmt.Errorf("mock error")
+			},
+			testFn: func(t *testing.T, source *DynamicSource, mockAuth *mockAuthority) {
+				// Stop the authority
+				mockAuth.doneCh <- nil
+			},
+			expStartErr: "certificate authority stopped unexpectedly",
+		},
+		{
+			name: "sign function returns error (retry, then success)",
+			signFunc: func() authority.SignFunc {
+				var called int
+				return func(template *x509.Certificate) (*x509.Certificate, error) {
+					called++
+					if called != 5 {
+						return nil, fmt.Errorf("mock error")
+					}
+
+					template.SerialNumber = big.NewInt(10)
+					template.NotBefore = time.Now()
+					template.NotAfter = template.NotBefore.Add(time.Minute)
+
+					return signUsingTempCA(t, template), nil
+				}
+			}(),
+			testFn: func(t *testing.T, source *DynamicSource, mockAuth *mockAuthority) {
+				for !source.Healthy() {
+					time.Sleep(50 * time.Millisecond)
+				}
+
+				// Call the GetCertificate method, should return a certificate
+				cert, err := source.GetCertificate(&tls.ClientHelloInfo{})
+				assert.NoError(t, err)
+				assert.NotNil(t, cert)
+			},
+		},
+		{
+			name: "don't rotate root",
+			signFunc: func(template *x509.Certificate) (*x509.Certificate, error) {
+				template.SerialNumber = big.NewInt(10)
+				template.NotBefore = time.Now()
+				template.NotAfter = template.NotBefore.Add(time.Minute)
+
+				return signUsingTempCA(t, template), nil
+			},
+			testFn: func(t *testing.T, source *DynamicSource, mockAuth *mockAuthority) {
+				for !source.Healthy() {
+					time.Sleep(50 * time.Millisecond)
+				}
+
+				// Call the GetCertificate method, should return a certificate
+				cert, err := source.GetCertificate(&tls.ClientHelloInfo{})
+				assert.NoError(t, err)
+				assert.NotNil(t, cert)
+
+				// Sleep for a short time to allow the DynamicSource to generate a new certificate
+				// Which it should not do, as the root CA has not been rotated
+				time.Sleep(50 * time.Millisecond)
+
+				// Call the GetCertificate method, should return a NEW certificate
+				cert2, err := source.GetCertificate(&tls.ClientHelloInfo{})
+				assert.NoError(t, err)
+				assert.NotNil(t, cert2)
+
+				assert.Equal(t, cert.Certificate[0], cert2.Certificate[0])
+			},
+		},
+		{
+			name: "rotate root",
+			signFunc: func(template *x509.Certificate) (*x509.Certificate, error) {
+				template.SerialNumber = big.NewInt(10)
+				template.NotBefore = time.Now()
+				template.NotAfter = template.NotBefore.Add(time.Minute)
+
+				return signUsingTempCA(t, template), nil
+			},
+			testFn: func(t *testing.T, source *DynamicSource, mockAuth *mockAuthority) {
+				for !source.Healthy() {
+					time.Sleep(50 * time.Millisecond)
+				}
+
+				// Call the GetCertificate method, should return a certificate
+				cert, err := source.GetCertificate(&tls.ClientHelloInfo{})
+				assert.NoError(t, err)
+				assert.NotNil(t, cert)
+
+				for range 10 {
+					// Rotate the root
+					mockAuth.notifyCh <- struct{}{}
+
+					// Wait for the DynamicSource to generate a new certificate; how
+					// long that takes varies with the load on the test machine.
+					previous := cert
+					assert.Eventually(t, func() bool {
+						cert, err = source.GetCertificate(&tls.ClientHelloInfo{})
+						return err == nil && cert != nil && !bytes.Equal(cert.Certificate[0], previous.Certificate[0])
+					}, 10*time.Second, 10*time.Millisecond)
+				}
+			},
+		},
+		{
+			name: "expire leaf",
+			signFunc: func(template *x509.Certificate) (*x509.Certificate, error) {
+				template.SerialNumber = big.NewInt(10)
+				template.NotBefore = time.Now()
+				template.NotAfter = template.NotBefore.Add(150 * time.Millisecond)
+
+				signedCert := signUsingTempCA(t, template)
+				// Reset the NotBefore and NotAfter so we have high precision values here
+				signedCert.NotBefore = time.Now()
+				signedCert.NotAfter = signedCert.NotBefore.Add(150 * time.Millisecond)
+
+				// Should renew at 100ms after the NotBefore time
+
+				return signedCert, nil
+			},
+			testFn: func(t *testing.T, source *DynamicSource, mockAuth *mockAuthority) {
+				for !source.Healthy() {
+					time.Sleep(50 * time.Millisecond)
+				}
+
+				// Call the GetCertificate method, should return a certificate
+				cert, err := source.GetCertificate(&tls.ClientHelloInfo{})
+				assert.NoError(t, err)
+				assert.NotNil(t, cert)
+
+				for range 5 {
+					// Wait for the DynamicSource to renew the certificate, which
+					// should happen 100ms after its NotBefore time; how long the
+					// renewal takes varies with the load on the test machine.
+					previous := cert
+					assert.Eventually(t, func() bool {
+						cert, err = source.GetCertificate(&tls.ClientHelloInfo{})
+						return err == nil && cert != nil && !bytes.Equal(cert.Certificate[0], previous.Certificate[0])
+					}, 10*time.Second, 10*time.Millisecond)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Create a mock authority
+			mockAuth := &mockAuthority{
+				doneCh:   make(chan error),
+				signFunc: tc.signFunc,
+			}
+
+			// Create a DynamicSource instance with the mock authority
+			source := &DynamicSource{
+				Authority:     mockAuth,
+				RetryInterval: 1 * time.Millisecond,
+			}
+
+			// Start the DynamicSource
+			group, gctx := errgroup.WithContext(t.Context())
+			group.Go(func() error {
+				return source.Start(gctx)
+			})
+			tc.testFn(t, source, mockAuth)
+
+			if tc.expStartErr == "" {
+				// Start returns nil only after t.Context is cancelled, which
+				// happens just before Cleanup-registered functions are called.
+				t.Cleanup(func() {
+					assert.NoError(t, group.Wait())
+				})
+			} else {
+				// Wait while t.Context is still alive: Start must return this
+				// error on its own, not as a side effect of test shutdown.
+				assert.ErrorContains(t, group.Wait(), tc.expStartErr)
+			}
+		})
+	}
+}
+
+// TestStartRenewalWatcher uses synctest to control fake time, making the tests
+// deterministic and fast. Each case sets renewalAt and renewalAfter as offsets
+// from time.Now() inside the synctest bubble, advances the fake clock by
+// advanceBy, and then checks whether the watcher signalled the expected reason.
+func TestStartRenewalWatcher(t *testing.T) {
+	source := &DynamicSource{}
+
+	testCases := map[string]struct {
+		renewalAt      time.Duration // offset from time.Now(); 0 means zero time
+		renewalAfter   time.Duration // offset from time.Now(); 0 means derive from renewalAt
+		advanceBy      time.Duration // how far to advance the fake clock before checking
+		expectedResult renewalReason // empty means no signal expected
+	}{
+		"certificate about to expire": {
+			renewalAt:      5 * time.Second,
+			renewalAfter:   10 * time.Second,
+			advanceBy:      6 * time.Second,
+			expectedResult: certificateAboutToExpire,
+		},
+		"certificate renewal moment missed while paused": {
+			renewalAt:      100 * time.Second,
+			renewalAfter:   2 * time.Second,
+			advanceBy:      3 * time.Second,
+			expectedResult: certificateRenewalMomentMissed,
+		},
+		"zero renewal moment does not signal": {
+			advanceBy: 10 * time.Second,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var renewalAt time.Time
+				if tc.renewalAt > 0 {
+					renewalAt = time.Now().Add(tc.renewalAt)
+				}
+
+				var renewalAfter time.Time
+				if tc.renewalAfter > 0 {
+					renewalAfter = time.Now().Add(tc.renewalAfter)
+				} else {
+					renewalAfter = renewalAt.Add(renewalStaleAfter)
+				}
+
+				resultCh := source.startRenewalWatcher(t.Context(), renewalAt, renewalAfter, 1*time.Second)
+
+				time.Sleep(tc.advanceBy)
+				synctest.Wait()
+
+				if tc.expectedResult == "" {
+					select {
+					case reason := <-resultCh:
+						assert.Failf(t, "unexpected signal", "expected no signal when renewMoment is zero, got %q", reason)
+					default:
+					}
+				} else {
+					select {
+					case reason := <-resultCh:
+						assert.Equal(t, tc.expectedResult, reason)
+					default:
+						assert.Fail(t, "expected signal but channel was empty")
+					}
+				}
+			})
+		})
+	}
+}

@@ -1,0 +1,120 @@
+version: "2"
+linters:
+  default: none
+  settings:
+    dogsled:
+      # Checks assignments with too many blank identifiers.
+      # Default: 2
+      max-blank-identifiers: 4
+    exhaustive:
+      default-signifies-exhaustive: true
+    forbidigo:
+      # Resolve each expression's real type so rules can match by import path
+      # regardless of the local import alias
+      analyze-types: true
+      forbid:
+        # golangci-lint only applies its built-in "forbid" list when none is
+        # configured; defining our own replaces it, so the default rule banning
+        # stray debug prints is repeated here.
+        - pattern: ^(fmt\.Print(|f|ln)|print|println)$
+          msg: Do not commit print statements.
+        # Ban naming the forked ACME client type (e.g. constructing acme.Client)
+        # so clients can only be created via pkg/acme/accounts.NewClient.
+        - pattern: \.Client$
+          pkg: ^github\.com/cert-manager/cert-manager/third_party/forked/acme$
+          msg: >-
+            Do not construct the forked ACME client directly; obtain one via pkg/acme/accounts.NewClient.
+        - pattern: ^reflect\.DeepEqual$
+          msg: Do not use reflect.DeepEqual; use cmp.Diff/cmp.Equal or testify assert.Equal instead.
+    gosec:
+      excludes:
+        - G101 # Look for hardcoded credentials
+        - G204 # Audit use of command execution
+        - G306 # Poor file permissions used when writing to a file
+    staticcheck:
+      checks: ["all", "-ST1000", "-ST1001", "-ST1003", "-ST1005", "-ST1012", "-ST1016", "-ST1020", "-ST1021", "-ST1022", "-QF1001", "-QF1003", "-QF1008"]
+  exclusions:
+    generated: lax
+    presets: [comments, common-false-positives, legacy, std-error-handling]
+    paths: [third_party, builtin$, examples$]
+    rules:
+      # TODO(erikgb): Remove this exclusion to forbid reflect.DeepEqual in the complete codebase
+      - path-except: _test\.go$
+        text: 'use of `reflect\.DeepEqual` forbidden'
+        linters:
+          - forbidigo
+    warn-unused: true
+  disable:
+    - nilnil
+  enable:
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - canonicalheader
+    - contextcheck
+    - copyloopvar
+    - decorder
+    - dogsled
+    - dupword
+    - durationcheck
+    - errcheck
+    - errchkjson
+    - errname
+    - exhaustive
+    - exptostd
+    - forbidigo
+    - ginkgolinter
+    - gocheckcompilerdirectives
+    - gochecksumtype
+    - gocritic
+    - goheader
+    - goprintffuncname
+    - gosec
+    - gosmopolitan
+    - govet
+    - grouper
+    - importas
+    - ineffassign
+    - interfacebloat
+    - intrange
+    - loggercheck
+    - makezero
+    - mirror
+    - misspell
+    - modernize
+    - musttag
+    - nakedret
+    - nilerr
+    - nilnil
+    - noctx
+    - nolintlint
+    - nosprintfhostport
+    - predeclared
+    - promlinter
+    - protogetter
+    - reassign
+    - sloglint
+    - staticcheck
+    - tagalign
+    - testableexamples
+    - unconvert
+    - unparam
+    - unused
+    - usestdlibvars
+    - usetesting
+    - wastedassign
+formatters:
+  enable: [gci, gofmt]
+  settings:
+    gci:
+      sections:
+        - standard # Standard section: captures all standard packages.
+        - default # Default section: contains all imports that could not be matched to another section type.
+        - localmodule # Local module section: contains all local packages. This section is not present unless explicitly enabled.
+        - blank # Blank section: contains all blank imports. This section is not present unless explicitly enabled.
+        - dot # Dot section: contains all dot imports. This section is not present unless explicitly enabled.
+      custom-order: true
+  exclusions:
+    generated: lax
+    paths: [third_party, builtin$, examples$]

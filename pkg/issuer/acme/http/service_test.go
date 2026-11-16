@@ -1,151 +1,335 @@
+/*
+Copyright 2020 The cert-manager Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package http
 
 import (
-	"reflect"
+	"fmt"
 	"testing"
 
-	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/labels"
+	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	coretesting "k8s.io/client-go/testing"
 
-	"github.com/jetstack/cert-manager/pkg/apis/certmanager/v1alpha1"
-	"github.com/jetstack/cert-manager/test/util/generate"
+	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
+	testpkg "github.com/cert-manager/cert-manager/pkg/controller/test"
 )
 
 func TestEnsureService(t *testing.T) {
-	const createdServiceKey = "createdService"
-	tests := map[string]solverFixture{
-		"should return an existing service if one already exists": {
-			Certificate: generate.Certificate(generate.CertificateConfig{
-				Name:         "test",
-				Namespace:    defaultTestNamespace,
-				DNSNames:     []string{"example.com"},
-				ACMEOrderURL: "testURL",
-				ACMESolverConfig: v1alpha1.ACMESolverConfig{
-					HTTP01: &v1alpha1.ACMECertificateHTTP01Config{},
+	type testT struct {
+		builder     *testpkg.Builder
+		chal        *cmacme.Challenge
+		expectedErr bool
+	}
+	var (
+		testNamespace = "foo"
+		chal          = &cmacme.Challenge{
+			Namespace: testNamespace,
+			Spec: cmacme.ChallengeSpec{
+				DNSName: "example.com",
+				Token:   "token",
+				Key:     "key",
+				Solver: cmacme.ACMEChallengeSolver{
+					HTTP01: &cmacme.ACMEChallengeSolverHTTP01{
+						Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{},
+					},
 				},
-			}),
-			Challenge: v1alpha1.ACMEOrderChallenge{
-				Domain: "example.com",
 			},
-			PreFn: func(s *solverFixture) {
-				svc, err := s.Solver.createService(s.Certificate, s.Challenge)
-				if err != nil {
-					s.f.T.Errorf("error preparing test: %v", err)
-				}
-				s.testResources[createdServiceKey] = svc
-
-				// TODO: replace this with expectedActions to make sure no other actions are performed
-				// create a reactor that fails the test if a service is created
-				s.f.KubeClient().PrependReactor("create", "services", func(action coretesting.Action) (handled bool, ret runtime.Object, err error) {
-					s.f.T.Errorf("ensureService should not create a service if one already exists")
-					s.f.T.Fail()
-					return false, ret, nil
-				})
-
-				s.f.Sync()
+		}
+		service = &corev1.Service{
+			GenerateName: "cm-acme-http-solver-",
+			Namespace:    testNamespace,
+			Labels:       podLabels(chal),
+			Annotations: map[string]string{
+				"auth.istio.io/8089": "NONE",
 			},
-			CheckFn: func(s *solverFixture, args ...interface{}) {
-				createdService := s.testResources[createdServiceKey].(*v1.Service)
-				resp := args[0].(*v1.Service)
-				if resp == nil {
-					s.f.T.Errorf("unexpected service = nil")
-					s.f.T.Fail()
-					return
-				}
-				if !reflect.DeepEqual(resp, createdService) {
-					s.f.T.Errorf("Expected %v to equal %v", resp, createdService)
-				}
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(chal, challengeGvk)},
+			Spec: corev1.ServiceSpec{
+				Type: corev1.ServiceTypeNodePort,
+				Ports: []corev1.ServicePort{
+					{
+						Name:       "http",
+						Port:       acmeSolverListenPort,
+						TargetPort: intstr.FromInt32(acmeSolverListenPort),
+					},
+				},
+				Selector: podLabels(chal),
 			},
+		}
+		serviceMeta = &metav1.PartialObjectMetadata{
+			APIVersion: "v1",
+			Kind:       "Service",
+			ObjectMeta: service.ObjectMeta,
+		}
+	)
+	tests := map[string]testT{
+		"should return an existing service if one already exists": {
+			builder: &testpkg.Builder{
+				PartialMetadataObjects: []runtime.Object{serviceMeta},
+			},
+			chal: chal,
 		},
 		"should create a new service if one does not exist": {
-			Certificate: generate.Certificate(generate.CertificateConfig{
-				Name:         "test",
-				Namespace:    defaultTestNamespace,
-				DNSNames:     []string{"example.com"},
-				ACMEOrderURL: "testURL",
-				ACMESolverConfig: v1alpha1.ACMESolverConfig{
-					HTTP01: &v1alpha1.ACMECertificateHTTP01Config{},
-				},
-			}),
-			Challenge: v1alpha1.ACMEOrderChallenge{
-				Domain: "example.com",
+			builder: &testpkg.Builder{
+				ExpectedActions: []testpkg.Action{testpkg.NewAction(coretesting.NewCreateAction(corev1.SchemeGroupVersion.WithResource("services"), testNamespace, service))},
 			},
-			PreFn: func(s *solverFixture) {
-				expectedService := buildService(s.Certificate, s.Challenge)
-				// create a reactor that fails the test if a service is created
-				s.f.KubeClient().PrependReactor("create", "services", func(action coretesting.Action) (handled bool, ret runtime.Object, err error) {
-					service := action.(coretesting.CreateAction).GetObject().(*v1.Service)
-					// clear service name as we don't know it yet in the expectedService
-					service.Name = ""
-					if !reflect.DeepEqual(service, expectedService) {
-						s.f.T.Errorf("Expected %v to equal %v", service, expectedService)
-					}
-					return false, ret, nil
-				})
+			chal: chal,
+		},
+		"should clean up if multiple services exist": {
+			builder: &testpkg.Builder{
+				PartialMetadataObjects: []runtime.Object{serviceMeta, func(s metav1.PartialObjectMetadata) *metav1.PartialObjectMetadata { s.Name = "foobar"; return &s }(*serviceMeta)},
+				KubeObjects:            []runtime.Object{service, func(s corev1.Service) *corev1.Service { s.Name = "foobar"; return &s }(*service)},
+				ExpectedActions: []testpkg.Action{testpkg.NewAction(coretesting.NewDeleteAction(corev1.SchemeGroupVersion.WithResource("services"), testNamespace, "foobar")),
+					testpkg.NewAction(coretesting.NewDeleteAction(corev1.SchemeGroupVersion.WithResource("services"), testNamespace, ""))},
+			},
+			chal:        chal,
+			expectedErr: true,
+		},
+		"http-01 ingress challenge with a service type specified should end up on the generated solver service": {
+			chal: func(chal *cmacme.Challenge) *cmacme.Challenge {
+				chal.Spec.Solver.HTTP01.Ingress.ServiceType = corev1.ServiceTypeClusterIP
+				return chal
+			}(chal.DeepCopy()),
+			builder: &testpkg.Builder{
+				ExpectedActions: []testpkg.Action{testpkg.NewAction(coretesting.NewCreateAction(corev1.SchemeGroupVersion.WithResource("services"), testNamespace, func(s *corev1.Service) *corev1.Service { s.Spec.Type = corev1.ServiceTypeClusterIP; return s }(service.DeepCopy())))},
+			},
+		},
+		"http-01 gateway httpRoute challenge without a service type should default to NodePort": {
+			chal: func(chal *cmacme.Challenge) *cmacme.Challenge {
+				chal.Spec.Solver.HTTP01.Ingress = nil
+				chal.Spec.Solver.HTTP01.GatewayHTTPRoute = &cmacme.ACMEChallengeSolverHTTP01GatewayHTTPRoute{}
+				return chal
+			}(chal.DeepCopy()),
+			builder: &testpkg.Builder{
+				ExpectedActions: []testpkg.Action{testpkg.NewAction(coretesting.NewCreateAction(corev1.SchemeGroupVersion.WithResource("services"), testNamespace, service))},
+			},
+		},
+		"http-01 gateway httpRoute challenge with a service type specified should end up on the generated solver service": {
+			chal: func(chal *cmacme.Challenge) *cmacme.Challenge {
+				chal.Spec.Solver.HTTP01.Ingress = nil
+				chal.Spec.Solver.HTTP01.GatewayHTTPRoute = &cmacme.ACMEChallengeSolverHTTP01GatewayHTTPRoute{
+					ServiceType: corev1.ServiceTypeClusterIP,
+				}
+				return chal
+			}(chal.DeepCopy()),
+			builder: &testpkg.Builder{
+				ExpectedActions: []testpkg.Action{testpkg.NewAction(coretesting.NewCreateAction(corev1.SchemeGroupVersion.WithResource("services"), testNamespace, func(s *corev1.Service) *corev1.Service { s.Spec.Type = corev1.ServiceTypeClusterIP; return s }(service.DeepCopy())))},
+			},
+		},
+	}
+	for name, scenario := range tests {
+		t.Run(name, func(t *testing.T) {
+			scenario.builder.T = t
+			scenario.builder.InitWithRESTConfig()
+			s := &Solver{
+				Context:       scenario.builder.Context,
+				serviceLister: scenario.builder.HTTP01ResourceMetadataInformersFactory.ForResource(corev1.SchemeGroupVersion.WithResource("services")).Lister(),
+			}
+			scenario.builder.Start()
+			defer scenario.builder.Stop()
+			_, err := s.ensureService(t.Context(), scenario.chal)
+			if err != nil != scenario.expectedErr {
+				t.Fatalf("unexpected error: wants err: %t, got err %v", scenario.expectedErr, err)
 
-				s.f.Sync()
+			}
+			scenario.builder.CheckAndFinish()
+		})
+
+	}
+}
+
+func TestGetServicesForChallenge(t *testing.T) {
+	type testT struct {
+		builder            *testpkg.Builder
+		chal               *cmacme.Challenge
+		wantedServiceMetas []*metav1.PartialObjectMetadata
+		expectedErr        bool
+	}
+	var (
+		testNamespace = "foo"
+		chal          = &cmacme.Challenge{
+			Namespace: testNamespace,
+			Spec: cmacme.ChallengeSpec{
+				DNSName: "example.com",
+				Token:   "token",
+				Key:     "key",
+				Solver: cmacme.ACMEChallengeSolver{
+					HTTP01: &cmacme.ACMEChallengeSolverHTTP01{
+						Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{},
+					},
+				},
 			},
-			CheckFn: func(s *solverFixture, args ...interface{}) {
-				resp := args[0].(*v1.Service)
-				err := args[1]
-				if resp == nil && err == nil {
-					s.f.T.Errorf("unexpected service = nil")
-					s.f.T.Fail()
-					return
+		}
+		service = &corev1.Service{
+			GenerateName: "cm-acme-http-solver-",
+			Namespace:    testNamespace,
+			Labels:       podLabels(chal),
+			Annotations: map[string]string{
+				"auth.istio.io/8089": "NONE",
+			},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(chal, challengeGvk)},
+			Spec: corev1.ServiceSpec{
+				Type: corev1.ServiceTypeNodePort,
+				Ports: []corev1.ServicePort{
+					{
+						Name:       "http",
+						Port:       acmeSolverListenPort,
+						TargetPort: intstr.FromInt32(acmeSolverListenPort),
+					},
+				},
+				Selector: podLabels(chal),
+			},
+		}
+		serviceMeta = &metav1.PartialObjectMetadata{
+			APIVersion: "v1",
+			Kind:       "Service",
+			ObjectMeta: service.ObjectMeta,
+		}
+	)
+	tests := map[string]testT{
+		"should return one service that matches": {
+			chal: chal,
+			builder: &testpkg.Builder{
+				PartialMetadataObjects: []runtime.Object{serviceMeta},
+			},
+			wantedServiceMetas: []*metav1.PartialObjectMetadata{serviceMeta},
+		},
+	}
+	for name, scenario := range tests {
+		t.Run(name, func(t *testing.T) {
+			scenario.builder.T = t
+			scenario.builder.InitWithRESTConfig()
+			s := &Solver{
+				Context:       scenario.builder.Context,
+				serviceLister: scenario.builder.HTTP01ResourceMetadataInformersFactory.ForResource(corev1.SchemeGroupVersion.WithResource("services")).Lister(),
+			}
+			scenario.builder.Start()
+			defer scenario.builder.Stop()
+			gotServiceMetas, err := s.getServicesForChallenge(t.Context(), scenario.chal)
+			if err != nil != scenario.expectedErr {
+				t.Fatalf("unexpected error: wants err: %t, got err %v", scenario.expectedErr, err)
+
+			}
+			assert.ElementsMatch(t, gotServiceMetas, scenario.wantedServiceMetas)
+			scenario.builder.CheckAndFinish()
+		})
+
+	}
+}
+
+func TestBuildServiceExtraLabels(t *testing.T) {
+	const createdServiceKey = "createdService"
+	tests := map[string]solverFixture{
+		"should apply extra labels from HTTP01SolverExtraLabels and filter ACME identity labels": {
+			Challenge: &cmacme.Challenge{
+				Spec: cmacme.ChallengeSpec{
+					DNSName: "example.com",
+					Token:   "token",
+					Key:     "key",
+					Solver: cmacme.ACMEChallengeSolver{
+						HTTP01: &cmacme.ACMEChallengeSolverHTTP01{
+							Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{},
+						},
+					},
+				},
+			},
+			PreFn: func(t *testing.T, s *solverFixture) {
+				s.Solver.Context.ACMEOptions.HTTP01SolverExtraLabels = map[string]string{
+					cmacme.DomainLabelKey: "badvalue",
+					"custom-extra-label":  "custom-extra-value",
 				}
-				services, err := s.Solver.serviceLister.List(labels.NewSelector())
+				svc, err := s.Solver.buildService(s.Challenge)
 				if err != nil {
-					s.f.T.Errorf("unexpected error listing services: %v", err)
-					s.f.T.Fail()
+					t.Errorf("error building service: %v", err)
+				}
+				s.testResources[createdServiceKey] = svc
+				s.Builder.Sync()
+			},
+			CheckFn: func(t *testing.T, s *solverFixture, args ...any) {
+				expectedSvc := s.testResources[createdServiceKey].(*corev1.Service)
+				resp, ok := args[0].(*corev1.Service)
+				if !ok {
+					t.Errorf("expected service to be returned, but got %v", args[0])
+					t.Fail()
 					return
 				}
-				if len(services) != 1 {
-					s.f.T.Errorf("unexpected %d services in lister: %+v", len(services), services)
-					s.f.T.Fail()
-					return
+				// ACME identity label should not be overridden by extra labels
+				if resp.Labels[cmacme.DomainLabelKey] == "badvalue" {
+					t.Errorf("ACME identity label %s should not be overridden by extra labels, got %q",
+						cmacme.DomainLabelKey, resp.Labels[cmacme.DomainLabelKey])
 				}
-				if !reflect.DeepEqual(services[0], resp) {
-					s.f.T.Errorf("Expected %v to equal %v", services[0], resp)
+				// Non-ACME label should be present
+				if resp.Labels["custom-extra-label"] != "custom-extra-value" {
+					t.Errorf("expected non-ACME extra label %s=%s, got %q",
+						"custom-extra-label", "custom-extra-value", resp.Labels["custom-extra-label"])
+				}
+				expectedSvc.OwnerReferences = resp.OwnerReferences
+				expectedSvc.Name = resp.Name
+				expectedSvc.ManagedFields = resp.ManagedFields
+				if resp.String() != expectedSvc.String() {
+					t.Errorf("unexpected service built\nexp=%s\ngot=%s",
+						expectedSvc, resp)
+					t.Fail()
 				}
 			},
 		},
-		"should clean up if multiple services exist": {
-			Certificate: generate.Certificate(generate.CertificateConfig{
-				Name:         "test",
-				Namespace:    defaultTestNamespace,
-				DNSNames:     []string{"example.com"},
-				ACMEOrderURL: "testURL",
-				ACMESolverConfig: v1alpha1.ACMESolverConfig{
-					HTTP01: &v1alpha1.ACMECertificateHTTP01Config{},
+		"should not include extra labels in service selector": {
+			Challenge: &cmacme.Challenge{
+				Spec: cmacme.ChallengeSpec{
+					DNSName: "example.com",
+					Token:   "token",
+					Key:     "key",
+					Solver: cmacme.ACMEChallengeSolver{
+						HTTP01: &cmacme.ACMEChallengeSolverHTTP01{
+							Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{},
+						},
+					},
 				},
-			}),
-			Challenge: v1alpha1.ACMEOrderChallenge{
-				Domain: "example.com",
 			},
-			Err: true,
-			PreFn: func(s *solverFixture) {
-				_, err := s.Solver.createService(s.Certificate, s.Challenge)
-				if err != nil {
-					s.f.T.Errorf("error preparing test: %v", err)
+			PreFn: func(t *testing.T, s *solverFixture) {
+				s.Solver.Context.ACMEOptions.HTTP01SolverExtraLabels = map[string]string{
+					"custom-extra-label": "custom-extra-value",
 				}
-				_, err = s.Solver.createService(s.Certificate, s.Challenge)
+				svc, err := s.Solver.buildService(s.Challenge)
 				if err != nil {
-					s.f.T.Errorf("error preparing test: %v", err)
+					t.Errorf("error building service: %v", err)
 				}
-
-				s.f.Sync()
+				// Selector should only contain ACME identity labels, NOT extra labels
+				expectedSelector := podLabels(s.Challenge)
+				if !assert.ObjectsAreEqual(expectedSelector, svc.Spec.Selector) {
+					t.Errorf("service selector should not include extra labels\nexp=%s\ngot=%s",
+						expectedSelector, svc.Spec.Selector)
+				}
+				s.testResources[createdServiceKey] = svc
+				s.Builder.Sync()
 			},
-			CheckFn: func(s *solverFixture, args ...interface{}) {
-				services, err := s.Solver.serviceLister.List(labels.NewSelector())
-				if err != nil {
-					s.f.T.Errorf("error listing services: %v", err)
-					s.f.T.Fail()
+			CheckFn: func(t *testing.T, s *solverFixture, args ...any) {
+				resp, ok := args[0].(*corev1.Service)
+				if !ok {
+					t.Errorf("expected service to be returned, but got %v", args[0])
+					t.Fail()
 					return
 				}
-				if len(services) != 0 {
-					s.f.T.Errorf("expected services to have been cleaned up, but there were %d services left", len(services))
+				expectedSelector := podLabels(s.Challenge)
+				if !assert.ObjectsAreEqual(expectedSelector, resp.Spec.Selector) {
+					t.Errorf("service selector should not include extra labels\nexp=%s\ngot=%s",
+						expectedSelector, resp.Spec.Selector)
 				}
 			},
 		},
@@ -153,99 +337,75 @@ func TestEnsureService(t *testing.T) {
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			test.Setup(t)
-			resp, err := test.Solver.ensureService(test.Certificate, test.Challenge)
-			if err != nil && !test.Err {
-				t.Errorf("Expected function to not error, but got: %v", err)
-			}
-			if err == nil && test.Err {
-				t.Errorf("Expected function to get an error, but got: %v", err)
-			}
+			resp, err := test.Solver.createService(t.Context(), test.Challenge)
 			test.Finish(t, resp, err)
 		})
 	}
 }
 
-func TestGetServicesForCertificate(t *testing.T) {
-	const createdServiceKey = "createdService"
-	tests := map[string]solverFixture{
-		"should return one service that matches": {
-			Certificate: generate.Certificate(generate.CertificateConfig{
-				Name:         "test",
-				Namespace:    defaultTestNamespace,
-				DNSNames:     []string{"example.com"},
-				ACMEOrderURL: "testURL",
-				ACMESolverConfig: v1alpha1.ACMESolverConfig{
-					HTTP01: &v1alpha1.ACMECertificateHTTP01Config{},
+func TestCleanupServices(t *testing.T) {
+	testNamespace := "foo"
+	chal := &cmacme.Challenge{
+		Namespace: testNamespace,
+		Spec: cmacme.ChallengeSpec{
+			DNSName: "example.com",
+			Token:   "token",
+			Key:     "key",
+			Solver: cmacme.ACMEChallengeSolver{
+				HTTP01: &cmacme.ACMEChallengeSolverHTTP01{
+					Ingress: &cmacme.ACMEChallengeSolverHTTP01Ingress{},
 				},
-			}),
-			Challenge: v1alpha1.ACMEOrderChallenge{
-				Domain: "example.com",
-			},
-			PreFn: func(s *solverFixture) {
-				ing, err := s.Solver.createService(s.Certificate, s.Challenge)
-				if err != nil {
-					s.f.T.Errorf("error preparing test: %v", err)
-				}
-
-				s.testResources[createdServiceKey] = ing
-				s.f.Sync()
-			},
-			CheckFn: func(s *solverFixture, args ...interface{}) {
-				createdService := s.testResources[createdServiceKey].(*v1.Service)
-				resp := args[0].([]*v1.Service)
-				if len(resp) != 1 {
-					s.f.T.Errorf("expected one service to be returned, but got %d", len(resp))
-					s.f.T.Fail()
-					return
-				}
-				if !reflect.DeepEqual(resp[0], createdService) {
-					s.f.T.Errorf("Expected %v to equal %v", resp[0], createdService)
-				}
-			},
-		},
-		"should not return a service for the same certificate but different domain": {
-			Certificate: generate.Certificate(generate.CertificateConfig{
-				Name:      "test",
-				Namespace: defaultTestNamespace,
-				DNSNames:  []string{"example.com"},
-				ACMESolverConfig: v1alpha1.ACMESolverConfig{
-					HTTP01: &v1alpha1.ACMECertificateHTTP01Config{},
-				},
-			}),
-			Challenge: v1alpha1.ACMEOrderChallenge{
-				Domain: "example.com",
-			},
-			PreFn: func(s *solverFixture) {
-				_, err := s.Solver.createService(s.Certificate, v1alpha1.ACMEOrderChallenge{
-					Domain: "invaliddomain",
-				})
-				if err != nil {
-					s.f.T.Errorf("error preparing test: %v", err)
-				}
-
-				s.f.Sync()
-			},
-			CheckFn: func(s *solverFixture, args ...interface{}) {
-				resp := args[0].([]*v1.Service)
-				if len(resp) != 0 {
-					s.f.T.Errorf("expected zero services to be returned, but got %d", len(resp))
-					s.f.T.Fail()
-					return
-				}
 			},
 		},
 	}
-	for name, test := range tests {
+	serviceMeta := &metav1.PartialObjectMetadata{
+		APIVersion:      "v1",
+		Kind:            "Service",
+		Name:            "cm-acme-http-solver-abcde",
+		Namespace:       testNamespace,
+		Labels:          podLabels(chal),
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(chal, challengeGvk)},
+	}
+
+	tests := map[string]struct {
+		deleteErr   error
+		expectedErr bool
+	}{
+		// The metadata lister has the service but the API server does not, which
+		// is what a delete that already happened looks like from here.
+		"should not return an error if the service is already gone": {},
+		"should return an error if a delete fails": {
+			deleteErr:   fmt.Errorf("simulated error"),
+			expectedErr: true,
+		},
+	}
+
+	for name, scenario := range tests {
 		t.Run(name, func(t *testing.T) {
-			test.Setup(t)
-			resp, err := test.Solver.getServicesForChallenge(test.Certificate, test.Challenge)
-			if err != nil && !test.Err {
-				t.Errorf("Expected function to not error, but got: %v", err)
+			builder := &testpkg.Builder{
+				T:                      t,
+				PartialMetadataObjects: []runtime.Object{serviceMeta},
 			}
-			if err == nil && test.Err {
-				t.Errorf("Expected function to get an error, but got: %v", err)
+			builder.InitWithRESTConfig()
+			s := &Solver{
+				Context:       builder.Context,
+				serviceLister: builder.HTTP01ResourceMetadataInformersFactory.ForResource(corev1.SchemeGroupVersion.WithResource("services")).Lister(),
 			}
-			test.Finish(t, resp, err)
+			if scenario.deleteErr != nil {
+				builder.FakeKubeClient().PrependReactor("delete", "services", func(action coretesting.Action) (bool, runtime.Object, error) {
+					return true, nil, scenario.deleteErr
+				})
+			}
+			builder.Start()
+			defer builder.Stop()
+
+			err := s.cleanupServices(t.Context(), chal)
+			if err != nil && !scenario.expectedErr {
+				t.Errorf("expected no error, got: %v", err)
+			}
+			if err == nil && scenario.expectedErr {
+				t.Error("expected an error, got none")
+			}
 		})
 	}
 }

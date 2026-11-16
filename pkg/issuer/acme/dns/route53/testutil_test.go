@@ -1,3 +1,11 @@
+// +skip_license_check
+
+/*
+This file contains portions of code directly taken from the 'xenolf/lego' project.
+A copy of the license for this code can be found in the file named LICENSE in
+this directory.
+*/
+
 package route53
 
 import (
@@ -29,8 +37,9 @@ func newMockServer(t *testing.T, responses MockResponseMap) *httptest.Server {
 		}
 
 		w.Header().Set("Content-Type", "application/xml")
+		w.Header().Set("X-Amzn-Requestid", "SOMEREQUESTID")
 		w.WriteHeader(resp.StatusCode)
-		w.Write([]byte(resp.Body))
+		_, _ = w.Write([]byte(resp.Body))
 	}))
 
 	time.Sleep(100 * time.Millisecond)

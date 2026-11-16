@@ -1,0 +1,1724 @@
+/*
+Copyright 2020 The cert-manager Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package acme
+
+import (
+	"context"
+	"crypto"
+	"crypto/rsa"
+	"fmt"
+	"net/url"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
+	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
+	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/utils/clock"
+	fakeclock "k8s.io/utils/clock/testing"
+
+	"github.com/cert-manager/cert-manager/internal/test/testutil"
+	"github.com/cert-manager/cert-manager/pkg/acme/accounts"
+	fakeregistry "github.com/cert-manager/cert-manager/pkg/acme/accounts/test"
+	acmecl "github.com/cert-manager/cert-manager/pkg/acme/client"
+	apiutil "github.com/cert-manager/cert-manager/pkg/api/util"
+	cmacme "github.com/cert-manager/cert-manager/pkg/apis/acme/v1"
+	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
+	"github.com/cert-manager/cert-manager/pkg/controller"
+	controllertest "github.com/cert-manager/cert-manager/pkg/controller/test"
+	"github.com/cert-manager/cert-manager/pkg/util/errors"
+	"github.com/cert-manager/cert-manager/pkg/util/pki"
+	"github.com/cert-manager/cert-manager/test/unit/coreclients"
+	"github.com/cert-manager/cert-manager/test/unit/gen"
+	acmeapi "github.com/cert-manager/cert-manager/third_party/forked/acme"
+)
+
+func TestAcme_Setup(t *testing.T) {
+	var (
+		fixedClockStart = time.Now()
+		fakeclock       = fakeclock.NewFakeClock(fixedClockStart)
+		nowMetaTime     = metav1.NewTime(fakeclock.Now())
+
+		baseIssuer = gen.Issuer("test-issuer",
+			gen.SetIssuerACMEURL(acmev2Prod))
+		// base issuer's conditions
+		readyFalseCondition = gen.IssuerCondition(cmapi.IssuerConditionReady,
+			gen.SetIssuerConditionStatus(cmmeta.ConditionFalse),
+			gen.SetIssuerConditionLastTransitionTime(&nowMetaTime))
+		readyTrueCondition = gen.IssuerCondition(cmapi.IssuerConditionReady,
+			gen.SetIssuerConditionStatus(cmmeta.ConditionTrue),
+			gen.SetIssuerConditionReason(successAccountRegistered),
+			gen.SetIssuerConditionMessage(messageAccountRegistered),
+			gen.SetIssuerConditionLastTransitionTime(&nowMetaTime))
+		issuerSecretKeyName = "test"
+
+		ecdsaPrivKey = mustGenerateEDCSAKey(t)
+		rsaPrivKey   = mustGenerateRSAKey(t)
+
+		notFoundErr    = apierrors.NewNotFound(corev1.Resource("test"), "test")
+		invalidDataErr = errors.NewInvalidData("test")
+		someErr        = fmt.Errorf("test")
+		invalidURL     = "%"
+		acmeErr450     = &acmeapi.Error{StatusCode: 450}
+		acmeErr500     = &acmeapi.Error{StatusCode: 500}
+
+		// acmeErr450 and acmeErr500 carry no ProblemType, so they are not
+		// recognised as RFC 8555 problem documents and are reported by status
+		// code alone.
+		acmeErr450Message = fmt.Sprintf(messageTemplateNonACMEErrorResponse, 450)
+		acmeErr500Message = fmt.Sprintf(messageTemplateNonACMEErrorResponse, 500)
+
+		// conformantACMEErr is what a real ACME server returns. Its detail is
+		// useful to the operator and is safe to surface on the Issuer.
+		conformantACMEErr = &acmeapi.Error{
+			StatusCode:  400,
+			ProblemType: "urn:ietf:params:acme:error:invalidEmail",
+			Detail:      "contact email has an invalid domain: empty label",
+		}
+
+		// reflectedBodyACMEErr models a response from an endpoint which is not an
+		// ACME server. The ACME client cannot parse the body as a problem
+		// document, so it copies it verbatim into Detail; it must not reach the
+		// Issuer status or the Events raised alongside it.
+		reflectedBodySecret  = "AKIAIOSFODNN7EXAMPLE"
+		reflectedBodyACMEErr = &acmeapi.Error{
+			StatusCode: 403,
+			Detail:     fmt.Sprintf("{\"AccessKeyId\":%q,\"Token\":\"internal-only\"}", reflectedBodySecret),
+		}
+		// reflectedBody5xxACMEErr is the same, but with a status code which
+		// makes setup retry. That path returns the error to the Issuer
+		// controllers, which copy it into an Event of their own.
+		reflectedBody5xxACMEErr = &acmeapi.Error{
+			StatusCode: 502,
+			Detail:     fmt.Sprintf("{\"AccessKeyId\":%q,\"Token\":\"internal-only\"}", reflectedBodySecret),
+		}
+		reflectedBody5xxMessage = fmt.Sprintf(messageTemplateNonACMEErrorResponse, 502)
+		//TODO: we should probably mock calls to net/url instead of doing this.
+		invalidURLErr = parseURLErr(invalidURL)
+
+		invalidURLMessage        = fmt.Sprintf(messageTemplateFailedToParseURL, invalidURL, invalidURLErr)
+		invalidAccountURLMessage = fmt.Sprintf(messageTemplateFailedToParseAccountURL, invalidURL, invalidURLErr)
+
+		someEmail    = "test@test.com"
+		someEmailURL = fmt.Sprintf("mailto:%s", someEmail)
+
+		// to be used where we don't care what value is passed
+		someString = "test"
+
+		// eabSecret is a mock value for secret with EAB key that user would have created.
+		// 'ZEdWemRBbz0K' is 'test' double base64-encoded.
+		// cert-manager only accepts double-encoded values, see https://github.com/cert-manager/cert-manager/pull/3877#discussion_r610717791 .
+		eabSecret = gen.Secret(someString,
+			gen.SetSecretData(map[string][]byte{"key": []byte("ZEdWemRBbz0K")}))
+
+		// 'dGVzdAo=\n' is 'ZEdWemRBbz0K' decoded + a newline.
+		// This is the decoded EAB key that we send to the ACME server.
+		// TODO: could the newline cause any issues?
+		eabKey = "dGVzdAo=\n"
+	)
+
+	tests := map[string]struct {
+		issuer cmapi.GenericIssuer
+
+		// Private key returned by keyFromSecret stub.
+		kfsKey crypto.Signer
+		// Error returned by keyFromSecret stub.
+		kfsErr error
+
+		// Whether RemoveClient should be called.
+		removeClientShouldBeCalled bool
+
+		// Whether AddClient should be called.
+		addClientShouldBeCalled bool
+
+		// Error returned by cl.Register
+		registerErr error
+
+		// ACME account returned by cl.GetReg
+		getRegAcc *acmeapi.Account
+		// Error returned by cl.GetReg
+		getRegErr error
+
+		// Error return by cl.UpdateRegistration
+		updateRegError error
+
+		// Error returned when creating ACME account key.
+		acmePrivKeySecretCreateErr error
+		// ACME account key created by createAccountPrivateKey.
+		acmePrivKey *rsa.PrivateKey
+
+		eabSecret       *corev1.Secret
+		eabSecretGetErr error
+
+		// expected ACME account passed to cl.Register
+		expectedRegisteredAcc *acmeapi.Account
+		// expected issuer conditions after Setup has been called.
+		expectedConditions []cmapi.IssuerCondition
+		expectedEvents     []string
+		wantsErr           bool
+	}{
+		"LetsEncrypt ACME v1 prod URL specified, return early": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEURL(acmev1Prod)),
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorInvalidConfig),
+					gen.SetIssuerConditionMessage(fmt.Sprintf(messageTemplateUpdateToV2, acmev1Prod, acmev2Prod))),
+			},
+		},
+		"LetsEncrypt ACME v1 staging URL with trailing slash specified, return early": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEURL(fmt.Sprintf("%s/", acmev1Staging))),
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorInvalidConfig),
+					gen.SetIssuerConditionMessage(fmt.Sprintf(messageTemplateUpdateToV2, fmt.Sprintf("%s/", acmev1Staging), acmev2Staging))),
+			},
+		},
+		"ACME private key secret does not exist, account key generation not disabled, key secret creation fails": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEPrivKeyRef(issuerSecretKeyName)),
+			kfsErr:                     notFoundErr,
+			acmePrivKeySecretCreateErr: someErr,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorAccountRegistrationFailed),
+					gen.SetIssuerConditionMessage(messageAccountRegistrationFailed+someErr.Error())),
+			},
+			wantsErr: true,
+		},
+		"ACME private key secret does not exist, account key generation is disabled": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEDisableAccountKeyGeneration(true),
+			),
+			kfsErr: notFoundErr,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorAccountVerificationFailed),
+					gen.SetIssuerConditionMessage(messageAccountVerificationFailed+messageNoSecretKeyGenerationDisabled+notFoundErr.Error())),
+			},
+			wantsErr: true,
+		},
+		"ACME private key secret does not exist, account key generation is enabled, key creation succeeds": {
+			issuer:      gen.IssuerFrom(baseIssuer),
+			kfsErr:      notFoundErr,
+			acmePrivKey: rsaPrivKey.(*rsa.PrivateKey),
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyTrueCondition)},
+			removeClientShouldBeCalled: true,
+			addClientShouldBeCalled:    true,
+			expectedRegisteredAcc:      &acmeapi.Account{},
+		},
+		"ACME private key secret exists, but contains invalid private key": {
+			issuer: gen.IssuerFrom(baseIssuer),
+			kfsErr: invalidDataErr,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorAccountVerificationFailed),
+					gen.SetIssuerConditionMessage(fmt.Sprintf("%s%v", messageInvalidPrivateKey, invalidDataErr))),
+			},
+		},
+		"Checking ACME private key secret fails with an unknown error": {
+			issuer: gen.IssuerFrom(baseIssuer),
+			kfsErr: someErr,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorAccountVerificationFailed),
+					gen.SetIssuerConditionMessage(messageAccountVerificationFailed+someErr.Error())),
+			},
+			wantsErr: true,
+		},
+		"ACME account's key is not an RSA key": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEPrivKeyRef(issuerSecretKeyName)),
+			kfsKey: ecdsaPrivKey,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorAccountVerificationFailed),
+					gen.SetIssuerConditionMessage(fmt.Sprintf(messageTemplateNotRSA, issuerSecretKeyName))),
+			},
+		},
+		"ACME server URL is an invalid URL": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEURL(invalidURL)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorInvalidURL),
+					gen.SetIssuerConditionMessage(invalidURLMessage)),
+			},
+			expectedEvents: []string{
+				fmt.Sprintf("%s %s %s", corev1.EventTypeWarning, errorInvalidURL, invalidURLMessage)},
+		},
+		"ACME account URL is an invalid URL": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEAccountURL(invalidURL)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorInvalidURL),
+					gen.SetIssuerConditionMessage(invalidAccountURLMessage)),
+			},
+			expectedEvents: []string{
+				fmt.Sprintf("%s %s %s", corev1.EventTypeWarning, errorInvalidURL, invalidAccountURLMessage),
+			},
+		},
+		"ACME Issuer is ready, URL and email are matching": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEAccountURL(acmev2Prod),
+				gen.SetIssuerACMEEmail(someEmail),
+				gen.SetIssuerACMELastRegisteredEmail(someEmail),
+				gen.SetIssuerACMELastPrivateKeyHash(someString),
+				gen.AddIssuerCondition(
+					*gen.IssuerConditionFrom(readyTrueCondition,
+						gen.SetIssuerConditionStatus(cmmeta.ConditionTrue)))),
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyTrueCondition,
+					gen.SetIssuerConditionStatus(cmmeta.ConditionTrue),
+					gen.SetIssuerConditionMessage(messageAccountRegistered),
+					gen.SetIssuerConditionReason(successAccountRegistered)),
+			},
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			addClientShouldBeCalled:    true,
+		},
+		"EAB for issuer specified, but the corresponding secret is not found": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEEAB(someString, someString)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			eabSecretGetErr:            notFoundErr,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorAccountRegistrationFailed),
+					gen.SetIssuerConditionMessage(messageAccountRegistrationFailed+notFoundErr.Error())),
+			},
+			expectedEvents: []string{
+				fmt.Sprintf("%s %s %s", corev1.EventTypeWarning, errorAccountRegistrationFailed, messageAccountRegistrationFailed+notFoundErr.Error()),
+			},
+		},
+		"EAB for issuer specified, attempting to retrieve secret fails with unknown error": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEEAB(someString, someString)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			eabSecretGetErr:            someErr,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorAccountRegistrationFailed),
+					gen.SetIssuerConditionMessage(messageAccountRegistrationFailed+fmt.Sprintf(messageTemplateFailedToGetEABKey, someErr))),
+			},
+			wantsErr: true,
+		},
+		"Attempt to register ACME account returns unknown error": {
+			issuer:                     gen.IssuerFrom(baseIssuer),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			registerErr:                someErr,
+			expectedRegisteredAcc:      &acmeapi.Account{},
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorAccountRegistrationFailed),
+					gen.SetIssuerConditionMessage(messageAccountRegistrationFailed+someErr.Error())),
+			},
+			wantsErr: true,
+		},
+		"Attempt to register ACME account returns an ACME error in range [400,500)": {
+			issuer:                     gen.IssuerFrom(baseIssuer),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			expectedRegisteredAcc:      &acmeapi.Account{},
+			registerErr:                acmeErr450,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorAccountRegistrationFailed),
+					gen.SetIssuerConditionMessage(messageAccountRegistrationFailed+acmeErr450Message)),
+			},
+		},
+		"Attempt to register ACME account returns an ACME error outside of range [400,500)": {
+			issuer:                     gen.IssuerFrom(baseIssuer),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			expectedRegisteredAcc:      &acmeapi.Account{},
+			registerErr:                acmeErr500,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorAccountRegistrationFailed),
+					gen.SetIssuerConditionMessage(messageAccountRegistrationFailed+acmeErr500Message)),
+			},
+			wantsErr: true,
+		},
+		"Attempt to register ACME account returns a conformant ACME error": {
+			issuer:                     gen.IssuerFrom(baseIssuer),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			expectedRegisteredAcc:      &acmeapi.Account{},
+			registerErr:                conformantACMEErr,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorAccountRegistrationFailed),
+					gen.SetIssuerConditionMessage(messageAccountRegistrationFailed+conformantACMEErr.Error())),
+			},
+		},
+		"Attempt to register ACME account returns a response which is not a problem document": {
+			issuer:                     gen.IssuerFrom(baseIssuer),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			expectedRegisteredAcc:      &acmeapi.Account{},
+			registerErr:                reflectedBodyACMEErr,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorAccountRegistrationFailed),
+					gen.SetIssuerConditionMessage(messageAccountRegistrationFailed+fmt.Sprintf(messageTemplateNonACMEErrorResponse, 403))),
+			},
+		},
+		"Attempt to register ACME account returns a retryable response which is not a problem document": {
+			issuer:                     gen.IssuerFrom(baseIssuer),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			expectedRegisteredAcc:      &acmeapi.Account{},
+			registerErr:                reflectedBody5xxACMEErr,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorAccountRegistrationFailed),
+					gen.SetIssuerConditionMessage(messageAccountRegistrationFailed+reflectedBody5xxMessage)),
+			},
+			wantsErr: true,
+		},
+		"ACME account already exists, attempting to retrieve it fails with unknown error": {
+			issuer:                     gen.IssuerFrom(baseIssuer),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			expectedRegisteredAcc:      &acmeapi.Account{},
+			registerErr:                acmeapi.ErrAccountAlreadyExists,
+			getRegErr:                  someErr,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyFalseCondition,
+					gen.SetIssuerConditionReason(errorAccountRegistrationFailed),
+					gen.SetIssuerConditionMessage(messageAccountRegistrationFailed+someErr.Error())),
+			},
+			wantsErr: true,
+		},
+		"ACME account with EAB registered successfully": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEEAB(someString, someString)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			addClientShouldBeCalled:    true,
+			eabSecret:                  eabSecret,
+			expectedRegisteredAcc: &acmeapi.Account{ExternalAccountBinding: &acmeapi.ExternalAccountBinding{
+				KID: someString,
+				Key: []byte(eabKey),
+			}},
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyTrueCondition,
+					gen.SetIssuerConditionStatus(cmmeta.ConditionTrue),
+					gen.SetIssuerConditionReason(successAccountRegistered),
+					gen.SetIssuerConditionMessage(messageAccountRegistered)),
+			},
+		},
+		"ACME account with legacy EAB key algorithm set and with an email is registered successfully": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEEmail(someEmail),
+				gen.SetIssuerACMEEABWithKeyAlgorithm(someString, someString, cmacme.HS256)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			addClientShouldBeCalled:    true,
+			eabSecret:                  eabSecret,
+			expectedRegisteredAcc: &acmeapi.Account{ExternalAccountBinding: &acmeapi.ExternalAccountBinding{
+				KID: someString,
+				Key: []byte(eabKey),
+			},
+				Contact: []string{someEmailURL},
+			},
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyTrueCondition,
+					gen.SetIssuerConditionStatus(cmmeta.ConditionTrue),
+					gen.SetIssuerConditionReason(successAccountRegistered),
+					gen.SetIssuerConditionMessage(messageAccountRegistered)),
+			},
+		},
+		"ACME account with legacy EAB key algorithm set, spec email different from registered email and registered successfully": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEEmail(someEmail),
+				gen.SetIssuerACMEEABWithKeyAlgorithm(someString, someString, cmacme.HS256)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			addClientShouldBeCalled:    true,
+			eabSecret:                  eabSecret,
+			registerErr:                acmeapi.ErrAccountAlreadyExists,
+			getRegAcc: &acmeapi.Account{ExternalAccountBinding: &acmeapi.ExternalAccountBinding{
+				KID: someString,
+				Key: []byte(eabKey),
+			},
+				Contact: []string{"some@test.com"},
+			},
+			expectedRegisteredAcc: &acmeapi.Account{ExternalAccountBinding: &acmeapi.ExternalAccountBinding{
+				KID: someString,
+				Key: []byte(eabKey),
+			},
+				Contact: []string{someEmailURL},
+			},
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyTrueCondition,
+					gen.SetIssuerConditionStatus(cmmeta.ConditionTrue),
+					gen.SetIssuerConditionReason(successAccountRegistered),
+					gen.SetIssuerConditionMessage(messageAccountRegistered)),
+			},
+		},
+		"ACME account with legacy EAB key algorithm set, spec email different from registered email and registered failed": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEEmail(someEmail),
+				gen.SetIssuerACMEEABWithKeyAlgorithm(someString, someString, cmacme.HS256)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			eabSecret:                  eabSecret,
+			registerErr:                acmeapi.ErrAccountAlreadyExists,
+			getRegAcc: &acmeapi.Account{ExternalAccountBinding: &acmeapi.ExternalAccountBinding{
+				KID: someString,
+				Key: []byte(eabKey),
+			},
+				Contact: []string{"some@test.com"},
+			},
+			expectedRegisteredAcc: &acmeapi.Account{ExternalAccountBinding: &acmeapi.ExternalAccountBinding{
+				KID: someString,
+				Key: []byte(eabKey),
+			},
+				Contact: []string{someEmailURL},
+			},
+			updateRegError: someErr,
+			wantsErr:       true,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyTrueCondition,
+					gen.SetIssuerConditionStatus(cmmeta.ConditionFalse),
+					gen.SetIssuerConditionReason(errorAccountUpdateFailed),
+					gen.SetIssuerConditionMessage(fmt.Sprintf("%s%s", messageAccountUpdateFailed, someString))),
+			},
+			expectedEvents: []string{
+				fmt.Sprintf("%s %s %s", corev1.EventTypeWarning, errorAccountUpdateFailed, fmt.Sprintf("%s%s", messageAccountUpdateFailed, someString))},
+		},
+		"ACME account with legacy EAB key algorithm set, spec email different from registered email and registered failed with non-retryable ACME Error": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEEmail(someEmail),
+				gen.SetIssuerACMEEABWithKeyAlgorithm(someString, someString, cmacme.HS256)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			eabSecret:                  eabSecret,
+			registerErr:                acmeapi.ErrAccountAlreadyExists,
+			getRegAcc: &acmeapi.Account{ExternalAccountBinding: &acmeapi.ExternalAccountBinding{
+				KID: someString,
+				Key: []byte(eabKey),
+			},
+				Contact: []string{"some@test.com"},
+			},
+			expectedRegisteredAcc: &acmeapi.Account{ExternalAccountBinding: &acmeapi.ExternalAccountBinding{
+				KID: someString,
+				Key: []byte(eabKey),
+			},
+				Contact: []string{someEmailURL},
+			},
+			updateRegError: acmeErr450,
+			wantsErr:       false,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyTrueCondition,
+					gen.SetIssuerConditionStatus(cmmeta.ConditionFalse),
+					gen.SetIssuerConditionReason(errorAccountUpdateFailed),
+					gen.SetIssuerConditionMessage(fmt.Sprintf("%s%s", messageAccountUpdateFailed, acmeErr450Message))),
+			},
+			expectedEvents: []string{
+				fmt.Sprintf("%s %s %s", corev1.EventTypeWarning, errorAccountUpdateFailed, fmt.Sprintf("%s%s", messageAccountUpdateFailed, acmeErr450Message))},
+		},
+		"ACME account with legacy EAB key algorithm set, spec email different from registered email and registered failed with retryable ACME Error": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEEmail(someEmail),
+				gen.SetIssuerACMEEABWithKeyAlgorithm(someString, someString, cmacme.HS256)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			eabSecret:                  eabSecret,
+			registerErr:                acmeapi.ErrAccountAlreadyExists,
+			getRegAcc: &acmeapi.Account{ExternalAccountBinding: &acmeapi.ExternalAccountBinding{
+				KID: someString,
+				Key: []byte(eabKey),
+			},
+				Contact: []string{"some@test.com"},
+			},
+			expectedRegisteredAcc: &acmeapi.Account{ExternalAccountBinding: &acmeapi.ExternalAccountBinding{
+				KID: someString,
+				Key: []byte(eabKey),
+			},
+				Contact: []string{someEmailURL},
+			},
+			updateRegError: acmeErr500,
+			wantsErr:       true,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyTrueCondition,
+					gen.SetIssuerConditionStatus(cmmeta.ConditionFalse),
+					gen.SetIssuerConditionReason(errorAccountUpdateFailed),
+					gen.SetIssuerConditionMessage(fmt.Sprintf("%s%s", messageAccountUpdateFailed, acmeErr500Message))),
+			},
+			expectedEvents: []string{
+				fmt.Sprintf("%s %s %s", corev1.EventTypeWarning, errorAccountUpdateFailed, fmt.Sprintf("%s%s", messageAccountUpdateFailed, acmeErr500Message))},
+		},
+		"Attempt to update ACME account returns a response which is not a problem document": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEEmail(someEmail)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			registerErr:                acmeapi.ErrAccountAlreadyExists,
+			getRegAcc:                  &acmeapi.Account{Contact: []string{"some@test.com"}},
+			expectedRegisteredAcc:      &acmeapi.Account{Contact: []string{someEmailURL}},
+			updateRegError:             reflectedBodyACMEErr,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyTrueCondition,
+					gen.SetIssuerConditionStatus(cmmeta.ConditionFalse),
+					gen.SetIssuerConditionReason(errorAccountUpdateFailed),
+					gen.SetIssuerConditionMessage(fmt.Sprintf("%s%s", messageAccountUpdateFailed, fmt.Sprintf(messageTemplateNonACMEErrorResponse, 403)))),
+			},
+			expectedEvents: []string{
+				fmt.Sprintf("%s %s %s", corev1.EventTypeWarning, errorAccountUpdateFailed, fmt.Sprintf("%s%s", messageAccountUpdateFailed, fmt.Sprintf(messageTemplateNonACMEErrorResponse, 403)))},
+		},
+		"Attempt to update ACME account returns a retryable response which is not a problem document": {
+			issuer: gen.IssuerFrom(baseIssuer,
+				gen.SetIssuerACMEEmail(someEmail)),
+			kfsKey:                     rsaPrivKey,
+			removeClientShouldBeCalled: true,
+			registerErr:                acmeapi.ErrAccountAlreadyExists,
+			getRegAcc:                  &acmeapi.Account{Contact: []string{"some@test.com"}},
+			expectedRegisteredAcc:      &acmeapi.Account{Contact: []string{someEmailURL}},
+			updateRegError:             reflectedBody5xxACMEErr,
+			wantsErr:                   true,
+			expectedConditions: []cmapi.IssuerCondition{
+				*gen.IssuerConditionFrom(readyTrueCondition,
+					gen.SetIssuerConditionStatus(cmmeta.ConditionFalse),
+					gen.SetIssuerConditionReason(errorAccountUpdateFailed),
+					gen.SetIssuerConditionMessage(fmt.Sprintf("%s%s", messageAccountUpdateFailed, reflectedBody5xxMessage))),
+			},
+			expectedEvents: []string{
+				fmt.Sprintf("%s %s %s", corev1.EventTypeWarning, errorAccountUpdateFailed, fmt.Sprintf("%s%s", messageAccountUpdateFailed, reflectedBody5xxMessage))},
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+
+			// Secrets client that will be called from the Setup function to
+			// create new secrets and get EAB secret.
+			// TODO: this secretsClient fake is really hacky. It relies on the
+			// fact that the Setup function currently only uses secretsClient to
+			// create account private key secret and to retrieve the EAB secret.
+			// We should refactor the Setup function and test this in a better way.
+			secretsClient := coreclients.NewFakeSecretsGetterFrom(
+				coreclients.NewFakeSecretsGetter(),
+				coreclients.SetFakeSecretsGetterCreate(nil,
+					test.acmePrivKeySecretCreateErr),
+				coreclients.SetFakeSecretsGetterGet(test.eabSecret,
+					test.eabSecretGetErr),
+			)
+
+			// Set up a mock keyFromSecret.
+			kfsWasCalled := false
+			kfs := keyFromSecretMockBuilder(&(kfsWasCalled), test.kfsKey, test.kfsErr)
+
+			// Mock ACME accounts registry.
+			removeClientWasCalled := false
+			addClientWasCalled := false
+			ar := &fakeregistry.FakeRegistry{
+				RemoveClientFunc: func(string) {
+					removeClientWasCalled = true
+				},
+				AddClientFunc: func(string, accounts.NewClientOptions) {
+					addClientWasCalled = true
+				},
+				IsKeyCheckSumCachedFunc: func(lastPrivateKeyHash string, privateKey *rsa.PrivateKey) bool {
+					return true
+				},
+			}
+
+			// Mock ACME client.
+			var gotAcc *acmeapi.Account
+			cl := acmecl.FakeACME{
+				FakeRegister: func(_ context.Context, a *acmeapi.Account, _ func(string) bool) (*acmeapi.Account, error) {
+					gotAcc = a
+					return a, test.registerErr
+				},
+				FakeGetReg: func(context.Context, string) (*acmeapi.Account, error) {
+					return test.getRegAcc, test.getRegErr
+				},
+				FakeUpdateReg: func(ctx context.Context, a *acmeapi.Account) (*acmeapi.Account, error) {
+					return a, test.updateRegError
+				},
+			}
+
+			// Mock events recorder.
+			recorder := new(controllertest.FakeRecorder)
+			a := Acme{
+				resourceNamespace: func(iss cmapi.GenericIssuer) string {
+					return iss.GetNamespace()
+				},
+				secretsClient:   secretsClient,
+				accountRegistry: ar,
+				keyFromSecret:   kfs,
+				clientBuilder:   clientBuilderMock(&cl),
+				recorder:        recorder,
+			}
+
+			// Stub the clock to get consistent last transition times on conditions.
+			fakeclock.SetTime(fixedClockStart)
+			apiutil.Clock = fakeclock
+			t.Cleanup(func() { apiutil.Clock = clock.RealClock{} })
+
+			// Verify that an error is/is not returned as expected.
+			gotErr := a.Setup(t.Context(), test.issuer)
+			if gotErr == nil && test.wantsErr {
+				t.Errorf("Expected error %v, got %v", test.wantsErr, gotErr)
+			}
+
+			// The Issuer controllers copy the error returned here into a
+			// Kubernetes Event, so it must not carry content chosen by the
+			// ACME server either.
+			if gotErr != nil && strings.Contains(gotErr.Error(), reflectedBodySecret) {
+				t.Errorf("Returned error leaks ACME server controlled content: %v", gotErr)
+			}
+
+			// Verify that a client was removed from cache if expected.
+			if removeClientWasCalled != test.removeClientShouldBeCalled {
+				t.Errorf("Expected Acme.accountsRegistry.RemoveClient to be called: %v, was called: %v",
+					test.removeClientShouldBeCalled,
+					removeClientWasCalled)
+			}
+
+			// Verify that a new client was added to cache if expected.
+			if addClientWasCalled != test.addClientShouldBeCalled {
+				t.Errorf("Expected Acme.accountsRegistry.AddClient to be called: %v, was called: %v",
+					test.addClientShouldBeCalled,
+					addClientWasCalled)
+			}
+
+			// Verify that the expected account value was passed when the
+			// account was registered.
+			testutil.AssertEqual(t, test.expectedRegisteredAcc, gotAcc)
+
+			// Verify issuer's state after Setup was called.
+			gotConditions := test.issuer.GetStatus().Conditions
+			diffErr := testutil.Diff(test.expectedConditions, gotConditions)
+			if diffErr != nil {
+				t.Errorf("Issuer conditions differ: %v", diffErr)
+			}
+
+			// Verify that the expected events were recorded.
+			if !slices.Equal(test.expectedEvents, recorder.Events) {
+				t.Errorf("Expected events:\n%+#v\ngot:%+#v",
+					test.expectedEvents,
+					recorder.Events)
+			}
+		})
+	}
+}
+
+// keyFromSecretMockBuilder returns a mock implementation of keyFromSecretFunc.
+func keyFromSecretMockBuilder(wasCalled *bool, key crypto.Signer, err error) keyFromSecretFunc {
+	return func(context.Context, string, string, string) (crypto.Signer, error) {
+		*wasCalled = true
+		return key, err
+	}
+}
+
+func clientBuilderMock(cl acmecl.Interface) accounts.NewClientFunc {
+	return func(_ accounts.NewClientOptions) acmecl.Interface {
+		return cl
+	}
+}
+
+func parseURLErr(s string) error {
+	_, err := url.Parse(s)
+	return err
+}
+
+func mustGenerateEDCSAKey(t *testing.T) crypto.Signer {
+	t.Helper()
+	key, err := pki.GenerateECPrivateKey(256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func mustGenerateRSAKey(t *testing.T) crypto.Signer {
+	t.Helper()
+	key, err := pki.GenerateRSAPrivateKey(pki.MinRSAKeySize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func TestSafeErrorMessage(t *testing.T) {
+	// secret stands in for content which the ACME server is able to reflect back
+	// to us but which the reader of an Issuer must not be able to see.
+	const secret = "AKIAIOSFODNN7EXAMPLE"
+
+	tests := map[string]struct {
+		err error
+		// want is the exact message expected, and is only checked when set.
+		want string
+		// wantContains is checked when want is empty.
+		wantContains string
+	}{
+		"a locally raised error is reported unchanged": {
+			err:  fmt.Errorf("failed to build ACME client"),
+			want: "failed to build ACME client",
+		},
+		"a conformant problem document is reported in full": {
+			err: &acmeapi.Error{
+				StatusCode:  400,
+				ProblemType: "urn:ietf:params:acme:error:rateLimited",
+				Detail:      "too many registrations for this IP",
+			},
+			want: "400 urn:ietf:params:acme:error:rateLimited: too many registrations for this IP",
+		},
+		"a conformant problem document is recognised regardless of casing": {
+			err: &acmeapi.Error{
+				StatusCode:  400,
+				ProblemType: "URN:IETF:PARAMS:ACME:ERROR:badCSR",
+				Detail:      "unsupported key type",
+			},
+			wantContains: "unsupported key type",
+		},
+		"a problem document in the pre-RFC 8555 namespace is reported in full": {
+			err: &acmeapi.Error{
+				StatusCode:  400,
+				ProblemType: "urn:acme:error:badNonce",
+				Detail:      "JWS has an invalid anti-replay nonce",
+			},
+			want: "400 urn:acme:error:badNonce: JWS has an invalid anti-replay nonce",
+		},
+		"a wrapped ACME error is still sanitised": {
+			err: fmt.Errorf("registering account: %w", &acmeapi.Error{
+				StatusCode: 403,
+				Detail:     secret,
+			}),
+			want: fmt.Sprintf(messageTemplateNonACMEErrorResponse, 403),
+		},
+		"a reflected response body is omitted": {
+			err: &acmeapi.Error{
+				StatusCode: 403,
+				Detail:     fmt.Sprintf("<html><body>%s</body></html>", secret),
+			},
+			want: fmt.Sprintf(messageTemplateNonACMEErrorResponse, 403),
+		},
+		"a problem document from a service which is not an ACME server is omitted": {
+			err: &acmeapi.Error{
+				StatusCode:  500,
+				ProblemType: "https://internal.example.com/errors/database",
+				Detail:      fmt.Sprintf("connection string: %s", secret),
+			},
+			want: fmt.Sprintf(messageTemplateNonACMEErrorResponse, 500),
+		},
+		"a URN outside the ACME error namespace is omitted": {
+			err: &acmeapi.Error{
+				StatusCode:  500,
+				ProblemType: "urn:ietf:params:acme:notanerror:" + secret,
+				Detail:      secret,
+			},
+			want: fmt.Sprintf(messageTemplateNonACMEErrorResponse, 500),
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := safeErrorMessage(test.err)
+
+			if strings.Contains(got, secret) {
+				t.Errorf("message leaks server controlled content: %q", got)
+			}
+			if len(got) > maxACMEErrorMessageLength {
+				t.Errorf("message is %d bytes, want at most %d", len(got), maxACMEErrorMessageLength)
+			}
+
+			switch {
+			case test.want != "":
+				if got != test.want {
+					t.Errorf("safeErrorMessage() = %q, want %q", got, test.want)
+				}
+			case test.wantContains != "":
+				if !strings.Contains(got, test.wantContains) {
+					t.Errorf("safeErrorMessage() = %q, want it to contain %q", got, test.wantContains)
+				}
+			}
+		})
+	}
+}
+
+func TestSafeErrorMessageBoundsLength(t *testing.T) {
+	// Even a conformant ACME server must not be able to fill the Issuer status,
+	// which is persisted to the API server.
+	err := &acmeapi.Error{
+		StatusCode:  400,
+		ProblemType: "urn:ietf:params:acme:error:malformed",
+		Detail:      strings.Repeat("a", 4*maxACMEErrorMessageLength),
+	}
+
+	got := safeErrorMessage(err)
+	if !strings.HasSuffix(got, errors.TruncationMarker) {
+		t.Errorf("safeErrorMessage() = %q, want it to be marked as truncated", got)
+	}
+	if len(got) > maxACMEErrorMessageLength {
+		t.Errorf("message is %d bytes, want at most %d", len(got), maxACMEErrorMessageLength)
+	}
+}
+
+func TestValidateDNSSolvers(t *testing.T) {
+	tests := []struct {
+		name             string
+		objectMeta       metav1.ObjectMeta
+		spec             cmapi.IssuerSpec
+		secrets          []*corev1.Secret
+		wantWarnings     []string
+		wantWarningCount int
+	}{
+		// Edge cases - no DNS solvers
+		{
+			name: "no DNS solvers configured",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{},
+					},
+				},
+			},
+			secrets:      []*corev1.Secret{},
+			wantWarnings: nil,
+		},
+		{
+			name: "issuer with no ACME spec generates no warnings",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec:         cmapi.IssuerSpec{},
+			secrets:      []*corev1.Secret{},
+			wantWarnings: nil,
+		},
+		{
+			name: "HTTP01 solver only generates no warnings",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								HTTP01: &cmacme.ACMEChallengeSolverHTTP01{},
+							},
+						},
+					},
+				},
+			},
+			secrets:      []*corev1.Secret{},
+			wantWarnings: nil,
+		},
+
+		// AcmeDNS solver
+		{
+			name: "AcmeDNS solver with existing secret",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									AcmeDNS: &cmacme.ACMEIssuerDNS01ProviderAcmeDNS{
+										AccountSecret: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "acme-dns-secret",
+											},
+											Key: "account",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets: []*corev1.Secret{
+				{
+					Name:      "acme-dns-secret",
+					Namespace: "default",
+					Data: map[string][]byte{
+						"account": []byte("test-account-data"),
+					},
+				},
+			},
+			wantWarnings: nil,
+		},
+		{
+			name: "AcmeDNS solver with missing secret",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									AcmeDNS: &cmacme.ACMEIssuerDNS01ProviderAcmeDNS{
+										AccountSecret: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "missing-secret",
+											},
+											Key: "account",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets:          []*corev1.Secret{},
+			wantWarningCount: 1,
+		},
+
+		// Akamai solver
+		{
+			name: "Akamai solver with all required secrets",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									Akamai: &cmacme.ACMEIssuerDNS01ProviderAkamai{
+										ClientSecret: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "akamai-secret",
+											},
+											Key: "client-secret",
+										},
+										ClientToken: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "akamai-secret",
+											},
+											Key: "client-token",
+										},
+										AccessToken: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "akamai-secret",
+											},
+											Key: "access-token",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets: []*corev1.Secret{
+				{
+					Name:      "akamai-secret",
+					Namespace: "default",
+					Data: map[string][]byte{
+						"client-secret": []byte("test-client-secret"),
+						"client-token":  []byte("test-client-token"),
+						"access-token":  []byte("test-access-token"),
+					},
+				},
+			},
+			wantWarnings: nil,
+		},
+		{
+			name: "Akamai solver with missing secrets",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									Akamai: &cmacme.ACMEIssuerDNS01ProviderAkamai{
+										ClientSecret: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "missing-secret",
+											},
+											Key: "client-secret",
+										},
+										ClientToken: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "missing-secret",
+											},
+											Key: "client-token",
+										},
+										AccessToken: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "missing-secret",
+											},
+											Key: "access-token",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets:          []*corev1.Secret{},
+			wantWarningCount: 3,
+		},
+
+		// AzureDNS solver
+		{
+			name: "AzureDNS solver with client secret",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									AzureDNS: &cmacme.ACMEIssuerDNS01ProviderAzureDNS{
+										ClientSecret: &cmmeta.SecretKeySelector{
+											Name: "azure-secret",
+											Key:  "client-secret",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets: []*corev1.Secret{
+				{
+					Name:      "azure-secret",
+					Namespace: "default",
+					Data: map[string][]byte{
+						"client-secret": []byte("test-client-secret"),
+					},
+				},
+			},
+			wantWarnings: nil,
+		},
+		{
+			name: "AzureDNS solver without client secret (e.g. using managed identity)",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									AzureDNS: &cmacme.ACMEIssuerDNS01ProviderAzureDNS{},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets:      []*corev1.Secret{},
+			wantWarnings: nil,
+		},
+
+		// CloudDNS solver
+		{
+			name: "CloudDNS solver with existing secret",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									CloudDNS: &cmacme.ACMEIssuerDNS01ProviderCloudDNS{
+										ServiceAccount: &cmmeta.SecretKeySelector{
+											Name: "clouddns-sa",
+											Key:  "service-account-key",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets: []*corev1.Secret{
+				{
+					Name:      "clouddns-sa",
+					Namespace: "default",
+					Data: map[string][]byte{
+						"service-account-key": []byte("test-sa-key"),
+					},
+				},
+			},
+			wantWarnings: nil,
+		},
+		{
+			name: "CloudDNS solver with missing secret",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									CloudDNS: &cmacme.ACMEIssuerDNS01ProviderCloudDNS{
+										ServiceAccount: &cmmeta.SecretKeySelector{
+											Name: "missing-secret",
+											Key:  "service-account-key",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets:          []*corev1.Secret{},
+			wantWarningCount: 1,
+		},
+
+		// Cloudflare solver
+		{
+			name: "Cloudflare solver with both APIKey and APIToken",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									Cloudflare: &cmacme.ACMEIssuerDNS01ProviderCloudflare{
+										APIKey: &cmmeta.SecretKeySelector{
+											Name: "cloudflare-api-key",
+											Key:  "api-key",
+										},
+										APIToken: &cmmeta.SecretKeySelector{
+											Name: "cloudflare-api-token",
+											Key:  "api-token",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets: []*corev1.Secret{
+				{
+					Name:      "cloudflare-api-key",
+					Namespace: "default",
+					Data: map[string][]byte{
+						"api-key": []byte("test-api-key"),
+					},
+				},
+				{
+					Name:      "cloudflare-api-token",
+					Namespace: "default",
+					Data: map[string][]byte{
+						"api-token": []byte("test-api-token"),
+					},
+				},
+			},
+			wantWarnings: nil,
+		},
+		{
+			name: "Cloudflare solver with only APIToken",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									Cloudflare: &cmacme.ACMEIssuerDNS01ProviderCloudflare{
+										APIToken: &cmmeta.SecretKeySelector{
+											Name: "cloudflare-api-token",
+											Key:  "api-token",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets: []*corev1.Secret{
+				{
+					Name:      "cloudflare-api-token",
+					Namespace: "default",
+					Data: map[string][]byte{
+						"api-token": []byte("test-api-token"),
+					},
+				},
+			},
+			wantWarnings: nil,
+		},
+
+		// DigitalOcean solver
+		{
+			name: "DigitalOcean solver with existing secret",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									DigitalOcean: &cmacme.ACMEIssuerDNS01ProviderDigitalOcean{
+										Token: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "do-token",
+											},
+											Key: "token",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets: []*corev1.Secret{
+				{
+					Name:      "do-token",
+					Namespace: "default",
+					Data: map[string][]byte{
+						"token": []byte("test-token"),
+					},
+				},
+			},
+			wantWarnings: nil,
+		},
+		{
+			name: "DigitalOcean solver with missing secret",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									DigitalOcean: &cmacme.ACMEIssuerDNS01ProviderDigitalOcean{
+										Token: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "missing-secret",
+											},
+											Key: "token",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets:          []*corev1.Secret{},
+			wantWarningCount: 1,
+		},
+
+		// RFC2136 solver
+		{
+			name: "RFC2136 solver with TSIG secret",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									RFC2136: &cmacme.ACMEIssuerDNS01ProviderRFC2136{
+										TSIGSecret: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "tsig-secret",
+											},
+											Key: "tsig-key",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets: []*corev1.Secret{
+				{
+					Name:      "tsig-secret",
+					Namespace: "default",
+					Data: map[string][]byte{
+						"tsig-key": []byte("test-tsig-key"),
+					},
+				},
+			},
+			wantWarnings: nil,
+		},
+		{
+			name: "RFC2136 solver with missing TSIG secret",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									RFC2136: &cmacme.ACMEIssuerDNS01ProviderRFC2136{
+										TSIGSecret: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "missing-secret",
+											},
+											Key: "tsig-key",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets:          []*corev1.Secret{},
+			wantWarningCount: 1,
+		},
+		{
+			name: "RFC2136 solver without TSIGSecret (empty Name)",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									RFC2136: &cmacme.ACMEIssuerDNS01ProviderRFC2136{
+										TSIGSecret: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "",
+											},
+											Key: "tsig-key",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets:      []*corev1.Secret{},
+			wantWarnings: nil,
+		},
+
+		// Route53 solver
+		{
+			name: "Route53 solver with both SecretAccessKey and SecretAccessKeyID",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									Route53: &cmacme.ACMEIssuerDNS01ProviderRoute53{
+										SecretAccessKey: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "route53-secret",
+											},
+											Key: "secret-access-key",
+										},
+										SecretAccessKeyID: &cmmeta.SecretKeySelector{
+											Name: "route53-access-key-id",
+											Key:  "access-key-id",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets: []*corev1.Secret{
+				{
+					Name:      "route53-secret",
+					Namespace: "default",
+					Data: map[string][]byte{
+						"secret-access-key": []byte("test-secret-access-key"),
+					},
+				},
+				{
+					Name:      "route53-access-key-id",
+					Namespace: "default",
+					Data: map[string][]byte{
+						"access-key-id": []byte("test-access-key-id"),
+					},
+				},
+			},
+			wantWarnings: nil,
+		},
+		{
+			name: "Route53 solver with missing secret",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									Route53: &cmacme.ACMEIssuerDNS01ProviderRoute53{
+										SecretAccessKey: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "missing-secret",
+											},
+											Key: "secret-access-key",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets:          []*corev1.Secret{},
+			wantWarningCount: 1,
+		},
+
+		// Multiple solvers with mixed results
+		{
+			name: "multiple DNS solvers with mixed results",
+			objectMeta: metav1.ObjectMeta{
+				Name:      "test-issuer",
+				Namespace: "default",
+			},
+			spec: cmapi.IssuerSpec{
+				IssuerConfig: cmapi.IssuerConfig{
+					ACME: &cmacme.ACMEIssuer{
+						Solvers: []cmacme.ACMEChallengeSolver{
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									DigitalOcean: &cmacme.ACMEIssuerDNS01ProviderDigitalOcean{
+										Token: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "do-token",
+											},
+											Key: "token",
+										},
+									},
+								},
+							},
+							{
+								DNS01: &cmacme.ACMEChallengeSolverDNS01{
+									AcmeDNS: &cmacme.ACMEIssuerDNS01ProviderAcmeDNS{
+										AccountSecret: cmmeta.SecretKeySelector{
+											LocalObjectReference: cmmeta.LocalObjectReference{
+												Name: "missing-secret",
+											},
+											Key: "account",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			secrets: []*corev1.Secret{
+				{
+					Name:      "do-token",
+					Namespace: "default",
+					Data: map[string][]byte{
+						"token": []byte("test-token"),
+					},
+				},
+			},
+			wantWarningCount: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		issOpt := controller.IssuerOptions{
+			ClusterResourceNamespace: "default",
+		}
+		a := &Acme{
+			secretsClient:     &fakeSecretGetter{secrets: tt.secrets},
+			resourceNamespace: issOpt.ResourceNamespace,
+		}
+		t.Run("Issuer-"+tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			issuer := &cmapi.Issuer{
+				ObjectMeta: tt.objectMeta,
+				Spec:       tt.spec,
+			}
+
+			runValidateDNSSolversTest(t, a, issuer, tt.wantWarnings, tt.wantWarningCount)
+		})
+
+		t.Run("ClusterIssuer-"+tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			clusterIssuer := &cmapi.ClusterIssuer{
+				Name: tt.objectMeta.Name,
+				Spec: tt.spec,
+			}
+
+			runValidateDNSSolversTest(t, a, clusterIssuer, tt.wantWarnings, tt.wantWarningCount)
+		})
+	}
+}
+
+func runValidateDNSSolversTest(t *testing.T, a *Acme, issuer cmapi.GenericIssuer, wantWarnings []string, wantWarningCount int) {
+	t.Helper()
+
+	warnings := a.validateDNSSolvers(context.Background(), issuer)
+
+	if wantWarnings != nil {
+		if len(warnings) != len(wantWarnings) {
+			t.Errorf("validateDNSSolvers() returned %d warnings, want %d", len(warnings), len(wantWarnings))
+		}
+		for i, wantWarning := range wantWarnings {
+			if i < len(warnings) && warnings[i] != wantWarning {
+				t.Errorf("validateDNSSolvers() warning[%d] = %v, want %v", i, warnings[i], wantWarning)
+			}
+		}
+	}
+
+	if wantWarningCount > 0 {
+		if len(warnings) != wantWarningCount {
+			t.Errorf("validateDNSSolvers() returned %d warnings, want %d. Warnings: %v", len(warnings), wantWarningCount, warnings)
+		}
+	}
+
+	if wantWarnings == nil && wantWarningCount == 0 && len(warnings) > 0 {
+		t.Errorf("validateDNSSolvers() returned unexpected warnings: %v", warnings)
+	}
+}
+
+type fakeSecretGetter struct {
+	secrets []*corev1.Secret
+}
+
+func (f *fakeSecretGetter) Secrets(namespace string) v1.SecretInterface {
+	return &fakeSecretClient{secret: f.secrets}
+}
+
+type fakeSecretClient struct {
+	secret []*corev1.Secret
+}
+
+func (s *fakeSecretClient) Create(ctx context.Context, secret *corev1.Secret, opts metav1.CreateOptions) (*corev1.Secret, error) {
+	return nil, nil
+}
+
+func (s *fakeSecretClient) Update(ctx context.Context, secret *corev1.Secret, opts metav1.UpdateOptions) (*corev1.Secret, error) {
+	return nil, nil
+}
+
+func (s *fakeSecretClient) Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error {
+	return nil
+
+}
+
+func (s *fakeSecretClient) DeleteCollection(ctx context.Context, opts metav1.DeleteOptions, listOpts metav1.ListOptions) error {
+	return nil
+}
+
+func (s *fakeSecretClient) Get(ctx context.Context, name string, opts metav1.GetOptions) (*corev1.Secret, error) {
+	for _, v := range s.secret {
+		if v.Name == name {
+			return v, nil
+		}
+	}
+	return nil, fmt.Errorf("not found")
+}
+
+func (s *fakeSecretClient) List(ctx context.Context, opts metav1.ListOptions) (*corev1.SecretList, error) {
+	return nil, nil
+}
+
+func (s *fakeSecretClient) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+	return nil, nil
+}
+
+func (s *fakeSecretClient) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (result *corev1.Secret, err error) {
+	return nil, nil
+}
+
+func (s *fakeSecretClient) Apply(ctx context.Context, secret *applycorev1.SecretApplyConfiguration, opts metav1.ApplyOptions) (result *corev1.Secret, err error) {
+	return nil, nil
+}

@@ -1,0 +1,106 @@
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: [
+    'github>cert-manager/makefile-modules:renovate-config.json5'
+  ],
+  baseBranchPatterns: [
+    'master',
+    'release-1.20',
+    'release-1.21',
+  ],
+  addLabels: [
+    'kind/cleanup',
+    'release-note-none',
+  ],
+  customManagers: [
+    {
+      customType: 'regex',
+      managerFilePatterns: [
+        'make/base_images.mk',
+      ],
+      matchStrings: [
+        '(?<depName>gcr\\.io\/[^@]+)@(?<currentDigest>sha256:[a-f0-9]{64})',
+      ],
+      datasourceTemplate: 'docker',
+      // this tag must match the tag used in hack/latest-base-images.sh
+      currentValueTemplate: 'nonroot'
+    },
+    {
+      customType: 'regex',
+      managerFilePatterns: [
+        'hack/latest-kgateway-images.sh',
+        'hack/latest-kind-images.sh',
+        'make/02_mod.mk',
+      ],
+      matchStrings: [
+        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+packageName=(?<packageName>\\S+)\\s*\\n(?<varName>[A-Za-z0-9_]+)\\s*(?::=|\\?=|=)\\s*(?<currentValue>\\S+)"
+      ]
+    },
+  ],
+  packageRules: [
+    {
+      description: 'Ungroup all updates on release branches',
+      matchBaseBranches: [
+        '/^release-.*/',
+      ],
+      groupName: null,
+    },
+    {
+      groupName: 'Base Images',
+      matchManagers: [
+        'custom.regex',
+      ],
+      matchFileNames: [
+        'make/base_images.mk',
+      ],
+      addLabels: [
+        'skip-review', // Adding label to allow PRs to automerge
+      ],
+    },
+    {
+      groupName: null,
+      matchManagers: [
+        'custom.regex',
+      ],
+      matchPackageNames: [
+        'kubernetes-sigs/kind',
+      ],
+      postUpgradeTasks: {
+        commands: [
+          'hack/latest-kind-images.sh',
+        ],
+      },
+    },
+    {
+      groupName: null,
+      matchManagers: [
+        'custom.regex',
+      ],
+      matchPackageNames: [
+        'cr.kgateway.dev/kgateway-dev/charts/kgateway',
+      ],
+      postUpgradeTasks: {
+        commands: [
+          'hack/latest-kgateway-images.sh',
+        ],
+      },
+    },
+    {
+      description: 'Ignore updates in general on release branches',
+      matchBaseBranches: [
+        '/^release-.*/',
+      ],
+      enabled: false,
+    },
+    {
+      description: 'Enable base image updates on release branches',
+      matchBaseBranches: [
+        '/^release-.*/',
+      ],
+      matchFileNames: [
+        'make/base_images.mk',
+      ],
+      enabled: true,
+    },
+  ],
+}

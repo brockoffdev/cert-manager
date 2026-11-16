@@ -1,4 +1,7 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+# +skip_license_check
+
 # Copyright 2017 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,32 +16,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This script will verify that the specified script files are valid, meaing:
+# This script will verify that the specified script files are valid, meaning:
 # - they have "set -o errexit" turned on at some point
 #
 # Usage: verify-errexit.sh [ dir | file ... ]
 # default args is the root of our source tree
 
+# Should usually be called via make: `make verify-errexit`
+
 set -o errexit
 set -o nounset
 set -o pipefail
 
-REPO_ROOT=$(dirname "${BASH_SOURCE}")/..
+echo "+++ validating all scripts set '-o errexit'" >&2
 
 if [ "$*" != "" ]; then
   args="$*"
 else
-  args=$(ls "$REPO_ROOT" | grep -v vendor | grep -v glide)
+  args=$(ls "$(pwd)" | grep -v 'external/' | grep -v 'bin' | grep -v '_bin' )
 fi
 
 # Gather the list of files that appear to be shell scripts.
 # Meaning they have some form of "#!...sh" as a line in them.
-shFiles=$(grep -rl '^#!.*sh$' $args)
+shFiles=$(grep -Rrl '^#!.*sh$' $args)
 
-tmp=/tmp/out$RANDOM
+tmp=$(mktemp)
+# Delete the temporary file as it should only exist if errors have occurred.
+rm $tmp
+
 for file in ${shFiles}; do
-  grep "set -o errexit" $file > /dev/null 2>&1 && continue
-  grep "set -[a-z]*e" $file > /dev/null 2>&1 && continue
+  grep "^set -o errexit" $file > /dev/null 2>&1 && continue
+  grep "^set -[a-z]*e" $file > /dev/null 2>&1 && continue
 
   echo $file: appears to be missing \"set -o errexit\" | tee -a $tmp
 done
